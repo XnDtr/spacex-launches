@@ -94,13 +94,22 @@ sqlite3 spacex.db "SELECT COUNT(*) FROM launches;"   # count unchanged
 Open `sql/er_diagram.md` on GitHub (renders Mermaid natively) or paste its
 contents into https://mermaid.live.
 
+Notes on the schema itself (see the header comment in `sql/schema.sql` for
+more): boolean-ish columns (`success`, `reused`, `decayed`, etc.) have
+`CHECK (col IN (0,1))` constraints so a bad value fails at write time instead
+of silently corrupting an aggregate later; every top-level table has a
+`last_ingested_at` audit column updated on every upsert so you can tell when
+a row was last refreshed; and the `ships`/`crew` API endpoints are
+deliberately out of scope (documented in the schema header) since nothing in
+this project's analysis needs them.
+
 ## Run the analysis
 
 ```bash
 python analysis/analysis.py --db spacex.db --out analysis/output
 ```
 
-Prints the two SQL question results (with the raw SQL shown) to stdout, and
+Prints the three SQL question results (with the raw SQL shown) to stdout, and
 saves two PNG charts from the pandas questions to `analysis/output/`.
 
 ### Questions answered
@@ -108,9 +117,13 @@ saves two PNG charts from the pandas questions to `analysis/output/`.
 1. **(SQL)** Has SpaceX's launch success rate improved year over year?
 2. **(SQL)** Does landing success rate hold up as a booster core is reused
    more times (1st flight vs. 10th flight, etc.), or does it degrade?
-3. **(pandas + matplotlib)** How has payload mass to each orbit class (LEO,
+3. **(SQL — CTE + JOIN + window function)** Which launchpads are trending
+   better or worse year over year, and by how much? Joins `launches` to
+   `launchpads` and uses `LAG()` to compute each pad's change against its own
+   prior year, isolating a per-pad signal that Q1's fleet-wide number hides.
+4. **(pandas + matplotlib)** How has payload mass to each orbit class (LEO,
    GTO, SSO, ...) evolved over time?
-4. **(pandas + matplotlib)** What does the Starlink constellation's altitude
+5. **(pandas + matplotlib)** What does the Starlink constellation's altitude
    distribution look like, and how fast is it being launched (satellites per
    month)?
 
