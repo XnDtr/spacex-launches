@@ -16,7 +16,7 @@ import matplotlib.pyplot as plt
 import pandas as pd
 
 
-def q1_success_rate_by_year(conn):
+def q1_success_rate_by_year(conn: sqlite3.Connection) -> pd.DataFrame:
     """Q1 (pure SQL) -- Has SpaceX's launch success rate improved over time?
 
     Why interesting: reliability trend is the headline metric for a launch
@@ -42,7 +42,7 @@ def q1_success_rate_by_year(conn):
     return df
 
 
-def q2_core_reuse_landing_success(conn):
+def q2_core_reuse_landing_success(conn: sqlite3.Connection) -> pd.DataFrame:
     """Q2 (pure SQL) -- Do more-reused boosters land as reliably as new ones?
 
     Why interesting: core reuse is the core (pun intended) of SpaceX's cost
@@ -70,8 +70,48 @@ def q2_core_reuse_landing_success(conn):
     return df
 
 
-def q3_payload_mass_by_orbit(conn, out_dir: pathlib.Path):
-    """Q3 (pandas + matplotlib) -- How has payload mass to each orbit class evolved?
+def q3_launchpad_success_trend(conn: sqlite3.Connection) -> pd.DataFrame:
+    """Q3 (pure SQL, CTE + JOIN + window function) -- Which launchpads are
+    trending better or worse year over year, and by how much?
+
+    Why interesting: Q1's year-over-year rate is fleet-wide and can hide a
+    launchpad-specific story (a bad year at one pad dragging down the
+    average while others improve, or a newly commissioned pad still working
+    out kinks). Joining launches to launchpads and using LAG() to compute
+    each pad's change vs. its own prior year isolates that signal instead of
+    just restating the aggregate from Q1.
+    """
+    sql = """
+        WITH yearly AS (
+            SELECT
+                lp.name                                          AS launchpad,
+                substr(l.date_utc, 1, 4)                         AS year,
+                COUNT(*)                                         AS total_launches,
+                ROUND(100.0 * SUM(l.success) / COUNT(*), 1)      AS success_rate_pct
+            FROM launches l
+            JOIN launchpads lp ON l.launchpad_id = lp.launchpad_id
+            WHERE l.upcoming = 0 AND l.success IS NOT NULL
+            GROUP BY lp.name, year
+        )
+        SELECT
+            launchpad, year, total_launches, success_rate_pct,
+            ROUND(
+                success_rate_pct
+                - LAG(success_rate_pct) OVER (PARTITION BY launchpad ORDER BY year),
+                1
+            ) AS pct_pt_change_vs_prev_year
+        FROM yearly
+        ORDER BY launchpad, year;
+    """
+    df = pd.read_sql_query(sql, conn)
+    print("\n=== Q3: Launchpad success-rate trend, year over year (CTE + JOIN + LAG window function) ===")
+    print(sql)
+    print(df.to_string(index=False))
+    return df
+
+
+def q4_payload_mass_by_orbit(conn: sqlite3.Connection, out_dir: pathlib.Path) -> pd.DataFrame:
+    """Q4 (pandas + matplotlib) -- How has payload mass to each orbit class evolved?
 
     Why interesting: rising mass-to-orbit for LEO/GTO over time is a direct
     signal of Falcon 9's growing capacity (block upgrades, reuse efficiency)
@@ -84,7 +124,7 @@ def q3_payload_mass_by_orbit(conn, out_dir: pathlib.Path):
         WHERE p.mass_kg IS NOT NULL AND p.orbit IS NOT NULL AND l.upcoming = 0;
     """
     df = pd.read_sql_query(sql, conn, parse_dates=["date_utc"])
-    print("\n=== Q3: Payload mass by orbit over time (pandas) ===")
+    print("\n=== Q4: Payload mass by orbit over time (pandas) ===")
     print(sql)
     print(df.describe(include="all").to_string())
 
@@ -99,15 +139,15 @@ def q3_payload_mass_by_orbit(conn, out_dir: pathlib.Path):
     ax.legend()
     fig.autofmt_xdate()
     fig.tight_layout()
-    out_path = out_dir / "q3_payload_mass_by_orbit.png"
+    out_path = out_dir / "q4_payload_mass_by_orbit.png"
     fig.savefig(out_path, dpi=120)
     plt.close(fig)
     print(f"Saved chart: {out_path}")
     return df
 
 
-def q4_starlink_altitude_and_cadence(conn, out_dir: pathlib.Path):
-    """Q4 (pandas + matplotlib) -- What does the Starlink constellation's
+def q5_starlink_altitude_and_cadence(conn: sqlite3.Connection, out_dir: pathlib.Path) -> pd.DataFrame:
+    """Q5 (pandas + matplotlib) -- What does the Starlink constellation's
     altitude distribution look like, and how fast is it being launched?
 
     Why interesting: Starlink is now the majority of SpaceX's launch manifest
@@ -123,7 +163,7 @@ def q4_starlink_altitude_and_cadence(conn, out_dir: pathlib.Path):
         WHERE s.height_km IS NOT NULL;
     """
     df = pd.read_sql_query(sql, conn, parse_dates=["launch_date"])
-    print("\n=== Q4: Starlink altitude distribution & launch cadence (pandas) ===")
+    print("\n=== Q5: Starlink altitude distribution & launch cadence (pandas) ===")
     print(sql)
     print(df["height_km"].describe().to_string())
 
@@ -147,14 +187,14 @@ def q4_starlink_altitude_and_cadence(conn, out_dir: pathlib.Path):
     fig.autofmt_xdate()
 
     fig.tight_layout()
-    out_path = out_dir / "q4_starlink_altitude_cadence.png"
+    out_path = out_dir / "q5_starlink_altitude_cadence.png"
     fig.savefig(out_path, dpi=120)
     plt.close(fig)
     print(f"Saved chart: {out_path}")
     return df
 
 
-def main():
+def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--db", default="spacex.db")
     parser.add_argument("--out", default="analysis/output")
@@ -166,8 +206,9 @@ def main():
     conn = sqlite3.connect(args.db)
     q1_success_rate_by_year(conn)
     q2_core_reuse_landing_success(conn)
-    q3_payload_mass_by_orbit(conn, out_dir)
-    q4_starlink_altitude_and_cadence(conn, out_dir)
+    q3_launchpad_success_trend(conn)
+    q4_payload_mass_by_orbit(conn, out_dir)
+    q5_starlink_altitude_and_cadence(conn, out_dir)
     conn.close()
 
 
