@@ -1,0 +1,4 @@
+[tool.pytest.ini_options]
+# lets `import ingest` work from tests/ without a manual sys.path hack
+pythonpath = ["scripts"]
+testpaths = ["tests"]

@@ -6,16 +6,12 @@ depending on api.spacexdata.com being reachable, so they run the same in CI
 as on a laptop.
 """
 import copy
-import pathlib
 import sqlite3
-import sys
 
 import pytest
 
-sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent / "scripts"))
-import ingest  # noqa: E402
-
-from fixtures import FIXTURES  # noqa: E402
+import ingest
+from fixtures import FIXTURES
 
 
 def make_db():
