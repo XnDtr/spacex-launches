@@ -18,9 +18,9 @@ API response inside the same transaction, which is equivalent to an upsert at
 the collection level and guarantees no duplicate/stale rows survive a re-run.
 """
 import argparse
+import logging
 import pathlib
 import sqlite3
-import sys
 import time
 
 import requests
@@ -40,6 +40,36 @@ ENDPOINTS = [
     "starlink",
 ]
 
+# Rough floors used only to flag a suspiciously small response (e.g. an error
+# page or an empty result) -- not validated against a live pull, so treat as
+# a sanity check to revisit once real counts are known.
+MIN_EXPECTED_COUNTS = {
+    "rockets": 1,
+    "launchpads": 1,
+    "landpads": 1,
+    "capsules": 1,
+    "cores": 1,
+    "launches": 100,
+    "payloads": 100,
+    "starlink": 500,
+}
+
+logger = logging.getLogger("spacex_ingest")
+
+
+def configure_logging(log_file: str) -> None:
+    logger.setLevel(logging.INFO)
+    logger.handlers.clear()
+    fmt = logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s")
+
+    stream_handler = logging.StreamHandler()
+    stream_handler.setFormatter(fmt)
+    logger.addHandler(stream_handler)
+
+    file_handler = logging.FileHandler(log_file)
+    file_handler.setFormatter(fmt)
+    logger.addHandler(file_handler)
+
 
 def fetch(endpoint: str, retries: int = 3, backoff: float = 2.0) -> requests.Response:
     """GET an endpoint with retries; returns the raw Response (caller reads .content/.json())."""
@@ -52,9 +82,53 @@ def fetch(endpoint: str, retries: int = 3, backoff: float = 2.0) -> requests.Res
             return resp
         except requests.RequestException as exc:
             last_error = exc
+            logger.warning("Fetch attempt %d/%d for %s failed: %s", attempt, retries, url, exc)
             if attempt < retries:
                 time.sleep(backoff * attempt)
     raise RuntimeError(f"Failed to fetch {url} after {retries} attempts: {last_error}")
+
+
+def validate_response(endpoint: str, data) -> None:
+    """Fail loudly on a shape we don't expect; warn on a suspiciously small payload.
+
+    The v4 GET-all endpoints this script uses return a plain JSON array. If
+    that ever changes (e.g. an error page, or the paginated {docs: [...]}
+    shape returned by the POST /query variant), we want a clear error instead
+    of a confusing downstream KeyError.
+    """
+    if not isinstance(data, list):
+        raise RuntimeError(
+            f"{endpoint}: expected a JSON array, got {type(data).__name__}. "
+            "The API may have returned an error page or a paginated wrapper "
+            "instead of the plain GET-all response this script expects."
+        )
+    expected_min = MIN_EXPECTED_COUNTS.get(endpoint, 0)
+    if len(data) < expected_min:
+        logger.warning(
+            "%s: got only %d record(s), expected at least ~%d. Response may be "
+            "incomplete or the API shape may have changed.",
+            endpoint, len(data), expected_min,
+        )
+
+
+def safe_map(rows: list, mapper, endpoint: str) -> list:
+    """Apply mapper to each row, logging and skipping any record that doesn't
+    match our assumptions instead of aborting the whole endpoint's load."""
+    mapped = []
+    skipped = 0
+    for r in rows:
+        try:
+            mapped.append(mapper(r))
+        except Exception:
+            skipped += 1
+            logger.warning(
+                "%s: skipping malformed record id=%s",
+                endpoint, r.get("id", "<unknown>") if isinstance(r, dict) else "<unknown>",
+                exc_info=True,
+            )
+    if skipped:
+        logger.warning("%s: skipped %d malformed record(s) out of %d", endpoint, skipped, len(rows))
+    return mapped
 
 
 def init_schema(conn: sqlite3.Connection) -> None:
@@ -79,17 +153,18 @@ def load_rockets(conn, rows):
             diameter_m=excluded.diameter_m, mass_kg=excluded.mass_kg,
             description=excluded.description
         """,
-        [
-            (
-                r["id"], r.get("name"), r.get("type"), int(bool(r.get("active"))),
-                r.get("stages"), r.get("boosters"), r.get("cost_per_launch"),
-                r.get("success_rate_pct"), r.get("first_flight"), r.get("country"),
-                r.get("company"), (r.get("height") or {}).get("meters"),
-                (r.get("diameter") or {}).get("meters"), (r.get("mass") or {}).get("kg"),
-                r.get("description"),
-            )
-            for r in rows
-        ],
+        safe_map(rows, _rocket_row, "rockets"),
+    )
+
+
+def _rocket_row(r):
+    return (
+        r["id"], r.get("name"), r.get("type"), int(bool(r.get("active"))),
+        r.get("stages"), r.get("boosters"), r.get("cost_per_launch"),
+        r.get("success_rate_pct"), r.get("first_flight"), r.get("country"),
+        r.get("company"), (r.get("height") or {}).get("meters"),
+        (r.get("diameter") or {}).get("meters"), (r.get("mass") or {}).get("kg"),
+        r.get("description"),
     )
 
 
@@ -108,15 +183,16 @@ def load_launchpads(conn, rows):
             launch_successes=excluded.launch_successes,
             status=excluded.status, details=excluded.details
         """,
-        [
-            (
-                r["id"], r.get("name"), r.get("full_name"), r.get("locality"),
-                r.get("region"), r.get("latitude"), r.get("longitude"),
-                r.get("launch_attempts"), r.get("launch_successes"),
-                r.get("status"), r.get("details"),
-            )
-            for r in rows
-        ],
+        safe_map(rows, _launchpad_row, "launchpads"),
+    )
+
+
+def _launchpad_row(r):
+    return (
+        r["id"], r.get("name"), r.get("full_name"), r.get("locality"),
+        r.get("region"), r.get("latitude"), r.get("longitude"),
+        r.get("launch_attempts"), r.get("launch_successes"),
+        r.get("status"), r.get("details"),
     )
 
 
@@ -138,16 +214,17 @@ def load_landpads(conn, rows):
             status=excluded.status, wikipedia=excluded.wikipedia,
             details=excluded.details
         """,
-        [
-            (
-                r["id"], r.get("name"), r.get("full_name"), r.get("type"),
-                r.get("locality"), r.get("region"), r.get("latitude"),
-                r.get("longitude"), r.get("landing_attempts"),
-                r.get("landing_successes"), r.get("status"),
-                r.get("wikipedia"), r.get("details"),
-            )
-            for r in rows
-        ],
+        safe_map(rows, _landpad_row, "landpads"),
+    )
+
+
+def _landpad_row(r):
+    return (
+        r["id"], r.get("name"), r.get("full_name"), r.get("type"),
+        r.get("locality"), r.get("region"), r.get("latitude"),
+        r.get("longitude"), r.get("landing_attempts"),
+        r.get("landing_successes"), r.get("status"),
+        r.get("wikipedia"), r.get("details"),
     )
 
 
@@ -165,14 +242,15 @@ def load_capsules(conn, rows):
             land_landings=excluded.land_landings,
             last_update=excluded.last_update
         """,
-        [
-            (
-                r["id"], r.get("serial"), r.get("status"), r.get("type"),
-                r.get("reuse_count"), r.get("water_landings"),
-                r.get("land_landings"), r.get("last_update"),
-            )
-            for r in rows
-        ],
+        safe_map(rows, _capsule_row, "capsules"),
+    )
+
+
+def _capsule_row(r):
+    return (
+        r["id"], r.get("serial"), r.get("status"), r.get("type"),
+        r.get("reuse_count"), r.get("water_landings"),
+        r.get("land_landings"), r.get("last_update"),
     )
 
 
@@ -192,15 +270,16 @@ def load_cores(conn, rows):
             asds_landings=excluded.asds_landings,
             last_update=excluded.last_update
         """,
-        [
-            (
-                r["id"], r.get("serial"), r.get("block"), r.get("status"),
-                r.get("reuse_count"), r.get("rtls_attempts"),
-                r.get("rtls_landings"), r.get("asds_attempts"),
-                r.get("asds_landings"), r.get("last_update"),
-            )
-            for r in rows
-        ],
+        safe_map(rows, _core_row, "cores"),
+    )
+
+
+def _core_row(r):
+    return (
+        r["id"], r.get("serial"), r.get("block"), r.get("status"),
+        r.get("reuse_count"), r.get("rtls_attempts"),
+        r.get("rtls_landings"), r.get("asds_attempts"),
+        r.get("asds_landings"), r.get("last_update"),
     )
 
 
@@ -231,30 +310,38 @@ def load_launches(conn, rows):
             webcast_url=excluded.webcast_url, article_url=excluded.article_url,
             wikipedia_url=excluded.wikipedia_url
         """,
-        [_launch_row(r) for r in rows],
+        safe_map(rows, _launch_row, "launches"),
     )
 
     # child collections: delete-then-reinsert per launch for idempotency
     failure_rows, core_rows, capsule_rows = [], [], []
     for r in rows:
-        lid = r["id"]
+        lid = r.get("id")
+        if lid is None:
+            continue  # already logged as skipped by safe_map above
         conn.execute("DELETE FROM launch_failures WHERE launch_id = ?", (lid,))
         conn.execute("DELETE FROM launch_cores WHERE launch_id = ?", (lid,))
         conn.execute("DELETE FROM launch_capsules WHERE launch_id = ?", (lid,))
 
         for f in r.get("failures") or []:
-            failure_rows.append((lid, f.get("time"), f.get("altitude"), f.get("reason")))
+            try:
+                failure_rows.append((lid, f.get("time"), f.get("altitude"), f.get("reason")))
+            except AttributeError:
+                logger.warning("launches: malformed failure entry on launch_id=%s", lid)
 
         for c in r.get("cores") or []:
-            core_rows.append(
-                (
-                    lid, c.get("core"), c.get("flight"), int(bool(c.get("gridfins"))),
-                    int(bool(c.get("legs"))), int(bool(c.get("reused"))),
-                    int(bool(c.get("landing_attempt"))),
-                    int(bool(c.get("landing_success"))) if c.get("landing_success") is not None else None,
-                    c.get("landing_type"), c.get("landpad"),
+            try:
+                core_rows.append(
+                    (
+                        lid, c.get("core"), c.get("flight"), int(bool(c.get("gridfins"))),
+                        int(bool(c.get("legs"))), int(bool(c.get("reused"))),
+                        int(bool(c.get("landing_attempt"))),
+                        int(bool(c.get("landing_success"))) if c.get("landing_success") is not None else None,
+                        c.get("landing_type"), c.get("landpad"),
+                    )
                 )
-            )
+            except AttributeError:
+                logger.warning("launches: malformed core entry on launch_id=%s", lid)
 
         for cap_id in r.get("capsules") or []:
             capsule_rows.append((lid, cap_id))
@@ -319,12 +406,14 @@ def load_payloads(conn, rows):
             apoapsis_km=excluded.apoapsis_km, inclination_deg=excluded.inclination_deg,
             period_min=excluded.period_min, lifespan_years=excluded.lifespan_years
         """,
-        [_payload_row(r) for r in rows],
+        safe_map(rows, _payload_row, "payloads"),
     )
 
     customer_rows, nationality_rows = [], []
     for r in rows:
-        pid = r["id"]
+        pid = r.get("id")
+        if pid is None:
+            continue  # already logged as skipped by safe_map above
         conn.execute("DELETE FROM payload_customers WHERE payload_id = ?", (pid,))
         conn.execute("DELETE FROM payload_nationalities WHERE payload_id = ?", (pid,))
         for c in r.get("customers") or []:
@@ -379,7 +468,7 @@ def load_starlink(conn, rows):
             semimajor_axis_km=excluded.semimajor_axis_km, decayed=excluded.decayed,
             decay_date=excluded.decay_date
         """,
-        [_starlink_row(r) for r in rows],
+        safe_map(rows, _starlink_row, "starlink"),
     )
 
 
@@ -412,7 +501,17 @@ LOADERS = {
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--db", default="spacex.db", help="path to SQLite database file")
+    parser.add_argument(
+        "--limit", type=int, default=None,
+        help="only load the first N records per endpoint, for a quick smoke test. "
+             "Note: the full response is still downloaded and validated -- this "
+             "only truncates what gets loaded into SQLite, it does not reduce "
+             "network traffic.",
+    )
+    parser.add_argument("--log-file", default="ingest.log", help="path to write a persistent run log")
     args = parser.parse_args()
+
+    configure_logging(args.log_file)
 
     conn = sqlite3.connect(args.db)
     conn.execute("PRAGMA foreign_keys = ON")
@@ -421,14 +520,17 @@ def main():
     total_raw_bytes = 0
     with conn:
         for endpoint in ENDPOINTS:
-            print(f"Fetching {endpoint} ...", file=sys.stderr)
+            logger.info("Fetching %s ...", endpoint)
             resp = fetch(endpoint)
             total_raw_bytes += len(resp.content)
             data = resp.json()
+            validate_response(endpoint, data)
+            if args.limit is not None:
+                data = data[: args.limit]
             LOADERS[endpoint](conn, data)
-            print(f"  loaded {len(data)} {endpoint} record(s)", file=sys.stderr)
+            logger.info("  loaded %d %s record(s)", len(data), endpoint)
 
-    print(f"Total raw JSON downloaded: {total_raw_bytes / 1_000_000:.2f} MB", file=sys.stderr)
+    logger.info("Total raw JSON downloaded: %.2f MB", total_raw_bytes / 1_000_000)
     conn.close()
 
 

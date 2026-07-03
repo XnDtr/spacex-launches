@@ -15,3 +15,7 @@ DATA-Technical Exercise-020726-194640.pdf
 
 .ipynb_checkpoints/
 .DS_Store
+.pytest_cache/
+
+# ingestion run log
+ingest.log
