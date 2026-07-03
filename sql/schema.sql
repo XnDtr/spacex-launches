@@ -2,6 +2,13 @@
 -- Source: https://github.com/r-spacex/SpaceX-API (docs: https://github.com/r-spacex/SpaceX-API/tree/master/docs)
 -- Natural keys from the API (24-char hex ids) are used as primary keys so that
 -- re-ingestion can UPSERT idempotently instead of inserting duplicates.
+--
+-- Scope note: the `ships` and `crew` endpoints are deliberately NOT modeled.
+-- They're low-value for the analysis questions this project answers (crew
+-- data barely exists pre-Commercial-Crew, and ship recovery data duplicates
+-- signal already captured via launch_cores/fairings), and including them
+-- would mean two more dimension tables and junctions for endpoints nothing
+-- downstream uses. Revisit if a future question needs them.
 
 PRAGMA foreign_keys = ON;
 
@@ -13,7 +20,7 @@ CREATE TABLE IF NOT EXISTS rockets (
     rocket_id           TEXT PRIMARY KEY,
     name                TEXT NOT NULL,
     type                TEXT,
-    active              INTEGER,
+    active              INTEGER CHECK (active IN (0, 1)),
     stages              INTEGER,
     boosters            INTEGER,
     cost_per_launch     INTEGER,
@@ -24,7 +31,8 @@ CREATE TABLE IF NOT EXISTS rockets (
     height_m            REAL,
     diameter_m          REAL,
     mass_kg             REAL,
-    description         TEXT
+    description         TEXT,
+    last_ingested_at    TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP)
 );
 
 CREATE TABLE IF NOT EXISTS launchpads (
@@ -38,7 +46,8 @@ CREATE TABLE IF NOT EXISTS launchpads (
     launch_attempts     INTEGER,
     launch_successes    INTEGER,
     status              TEXT,
-    details             TEXT
+    details             TEXT,
+    last_ingested_at    TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP)
 );
 
 CREATE TABLE IF NOT EXISTS landpads (
@@ -54,7 +63,8 @@ CREATE TABLE IF NOT EXISTS landpads (
     landing_successes   INTEGER,
     status              TEXT,
     wikipedia           TEXT,
-    details             TEXT
+    details             TEXT,
+    last_ingested_at    TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP)
 );
 
 CREATE TABLE IF NOT EXISTS capsules (
@@ -65,7 +75,8 @@ CREATE TABLE IF NOT EXISTS capsules (
     reuse_count         INTEGER,
     water_landings      INTEGER,
     land_landings       INTEGER,
-    last_update         TEXT
+    last_update         TEXT,
+    last_ingested_at    TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP)
 );
 
 CREATE TABLE IF NOT EXISTS cores (
@@ -78,7 +89,8 @@ CREATE TABLE IF NOT EXISTS cores (
     rtls_landings       INTEGER,
     asds_attempts       INTEGER,
     asds_landings       INTEGER,
-    last_update         TEXT
+    last_update         TEXT,
+    last_ingested_at    TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP)
 );
 
 -- ---------------------------------------------------------------------------
@@ -93,22 +105,23 @@ CREATE TABLE IF NOT EXISTS launches (
     date_unix             INTEGER,
     date_precision        TEXT,
     static_fire_date_utc  TEXT,
-    tbd                    INTEGER,
-    net                    INTEGER,
+    tbd                    INTEGER CHECK (tbd IN (0, 1)),
+    net                    INTEGER CHECK (net IN (0, 1)),
     launch_window_sec      INTEGER,
     rocket_id              TEXT REFERENCES rockets(rocket_id),
     launchpad_id           TEXT REFERENCES launchpads(launchpad_id),
-    success                INTEGER,
-    upcoming               INTEGER,
+    success                INTEGER CHECK (success IN (0, 1)),
+    upcoming               INTEGER CHECK (upcoming IN (0, 1)),
     details                TEXT,
-    fairings_reused        INTEGER,
-    fairings_recovery_attempt INTEGER,
-    fairings_recovered     INTEGER,
+    fairings_reused        INTEGER CHECK (fairings_reused IN (0, 1)),
+    fairings_recovery_attempt INTEGER CHECK (fairings_recovery_attempt IN (0, 1)),
+    fairings_recovered     INTEGER CHECK (fairings_recovered IN (0, 1)),
     patch_small            TEXT,
     patch_large            TEXT,
     webcast_url            TEXT,
     article_url            TEXT,
-    wikipedia_url           TEXT
+    wikipedia_url           TEXT,
+    last_ingested_at        TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP)
 );
 
 CREATE TABLE IF NOT EXISTS launch_failures (
@@ -124,11 +137,11 @@ CREATE TABLE IF NOT EXISTS launch_cores (
     launch_id           TEXT NOT NULL REFERENCES launches(launch_id),
     core_id             TEXT REFERENCES cores(core_id),
     core_flight_num     INTEGER,
-    gridfins            INTEGER,
-    legs                INTEGER,
-    reused              INTEGER,
-    landing_attempt     INTEGER,
-    landing_success     INTEGER,
+    gridfins            INTEGER CHECK (gridfins IN (0, 1)),
+    legs                INTEGER CHECK (legs IN (0, 1)),
+    reused              INTEGER CHECK (reused IN (0, 1)),
+    landing_attempt     INTEGER CHECK (landing_attempt IN (0, 1)),
+    landing_success     INTEGER CHECK (landing_success IN (0, 1)),
     landing_type        TEXT,
     landpad_id          TEXT REFERENCES landpads(landpad_id),
     PRIMARY KEY (launch_id, core_id)
@@ -150,7 +163,7 @@ CREATE TABLE IF NOT EXISTS payloads (
     name                 TEXT,
     type                 TEXT,
     launch_id            TEXT REFERENCES launches(launch_id),
-    reused               INTEGER,
+    reused               INTEGER CHECK (reused IN (0, 1)),
     mass_kg              REAL,
     orbit                TEXT,
     reference_system     TEXT,
@@ -162,7 +175,8 @@ CREATE TABLE IF NOT EXISTS payloads (
     apoapsis_km          REAL,
     inclination_deg      REAL,
     period_min           REAL,
-    lifespan_years       REAL
+    lifespan_years       REAL,
+    last_ingested_at     TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP)
 );
 
 CREATE TABLE IF NOT EXISTS payload_customers (
@@ -200,8 +214,9 @@ CREATE TABLE IF NOT EXISTS starlink (
     inclination_deg      REAL,
     period_min           REAL,
     semimajor_axis_km    REAL,
-    decayed              INTEGER,
-    decay_date           TEXT
+    decayed              INTEGER CHECK (decayed IN (0, 1)),
+    decay_date           TEXT,
+    last_ingested_at     TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP)
 );
 
 -- ---------------------------------------------------------------------------
