@@ -30,19 +30,20 @@ import logging
 import pathlib
 import sqlite3
 import time
-from typing import Any, Callable, Dict, List, Optional
+from collections.abc import Callable
+from typing import Any
 
 import requests
 
-JsonRecord = Dict[str, Any]
-Row = Dict[str, Any]
+JsonRecord = dict[str, Any]
+Row = dict[str, Any]
 RowMapper = Callable[[JsonRecord], Row]
 
 BASE_URL = "https://api.spacexdata.com/v4"
 SCRIPT_DIR = pathlib.Path(__file__).resolve().parent
 SCHEMA_PATH = SCRIPT_DIR.parent / "sql" / "schema.sql"
 
-ENDPOINTS: List[str] = [
+ENDPOINTS: list[str] = [
     "rockets",
     "launchpads",
     "landpads",
@@ -56,7 +57,7 @@ ENDPOINTS: List[str] = [
 # Rough floors used only to flag a suspiciously small response (e.g. an error
 # page or an empty result) -- not validated against a live pull, so treat as
 # a sanity check to revisit once real counts are known.
-MIN_EXPECTED_COUNTS: Dict[str, int] = {
+MIN_EXPECTED_COUNTS: dict[str, int] = {
     "rockets": 1,
     "launchpads": 1,
     "landpads": 1,
@@ -87,7 +88,7 @@ def configure_logging(log_file: str) -> None:
 def fetch(endpoint: str, retries: int = 3, backoff: float = 2.0) -> requests.Response:
     """GET an endpoint with retries; returns the raw Response (caller reads .content/.json())."""
     url = f"{BASE_URL}/{endpoint}"
-    last_error: Optional[Exception] = None
+    last_error: Exception | None = None
     for attempt in range(1, retries + 1):
         try:
             resp = requests.get(url, timeout=30)
@@ -124,10 +125,10 @@ def validate_response(endpoint: str, data: Any) -> None:
         )
 
 
-def safe_map(rows: List[JsonRecord], mapper: RowMapper, endpoint: str) -> List[Row]:
+def safe_map(rows: list[JsonRecord], mapper: RowMapper, endpoint: str) -> list[Row]:
     """Apply mapper to each row, logging and skipping any record that doesn't
     match our assumptions instead of aborting the whole endpoint's load."""
-    mapped: List[Row] = []
+    mapped: list[Row] = []
     skipped = 0
     for r in rows:
         try:
@@ -148,7 +149,7 @@ def init_schema(conn: sqlite3.Connection) -> None:
     conn.executescript(SCHEMA_PATH.read_text())
 
 
-def load_rockets(conn: sqlite3.Connection, rows: List[JsonRecord]) -> None:
+def load_rockets(conn: sqlite3.Connection, rows: list[JsonRecord]) -> None:
     conn.executemany(
         """
         INSERT INTO rockets (
@@ -187,7 +188,7 @@ def _rocket_row(r: JsonRecord) -> Row:
     }
 
 
-def load_launchpads(conn: sqlite3.Connection, rows: List[JsonRecord]) -> None:
+def load_launchpads(conn: sqlite3.Connection, rows: list[JsonRecord]) -> None:
     conn.executemany(
         """
         INSERT INTO launchpads (
@@ -220,7 +221,7 @@ def _launchpad_row(r: JsonRecord) -> Row:
     }
 
 
-def load_landpads(conn: sqlite3.Connection, rows: List[JsonRecord]) -> None:
+def load_landpads(conn: sqlite3.Connection, rows: list[JsonRecord]) -> None:
     conn.executemany(
         """
         INSERT INTO landpads (
@@ -257,7 +258,7 @@ def _landpad_row(r: JsonRecord) -> Row:
     }
 
 
-def load_capsules(conn: sqlite3.Connection, rows: List[JsonRecord]) -> None:
+def load_capsules(conn: sqlite3.Connection, rows: list[JsonRecord]) -> None:
     conn.executemany(
         """
         INSERT INTO capsules (
@@ -287,7 +288,7 @@ def _capsule_row(r: JsonRecord) -> Row:
     }
 
 
-def load_cores(conn: sqlite3.Connection, rows: List[JsonRecord]) -> None:
+def load_cores(conn: sqlite3.Connection, rows: list[JsonRecord]) -> None:
     conn.executemany(
         """
         INSERT INTO cores (
@@ -320,7 +321,7 @@ def _core_row(r: JsonRecord) -> Row:
     }
 
 
-def load_launches(conn: sqlite3.Connection, rows: List[JsonRecord]) -> None:
+def load_launches(conn: sqlite3.Connection, rows: list[JsonRecord]) -> None:
     conn.executemany(
         """
         INSERT INTO launches (
@@ -358,9 +359,9 @@ def load_launches(conn: sqlite3.Connection, rows: List[JsonRecord]) -> None:
     )
 
     # child collections: delete-then-reinsert per launch for idempotency
-    failure_rows: List[Row] = []
-    core_rows: List[Row] = []
-    capsule_rows: List[Row] = []
+    failure_rows: list[Row] = []
+    core_rows: list[Row] = []
+    capsule_rows: list[Row] = []
     for r in rows:
         lid = r.get("id")
         if lid is None:
@@ -453,7 +454,7 @@ def _launch_row(r: JsonRecord) -> Row:
     }
 
 
-def load_payloads(conn: sqlite3.Connection, rows: List[JsonRecord]) -> None:
+def load_payloads(conn: sqlite3.Connection, rows: list[JsonRecord]) -> None:
     conn.executemany(
         """
         INSERT INTO payloads (
@@ -481,8 +482,8 @@ def load_payloads(conn: sqlite3.Connection, rows: List[JsonRecord]) -> None:
         safe_map(rows, _payload_row, "payloads"),
     )
 
-    customer_rows: List[Row] = []
-    nationality_rows: List[Row] = []
+    customer_rows: list[Row] = []
+    nationality_rows: list[Row] = []
     for r in rows:
         pid = r.get("id")
         if pid is None:
@@ -525,7 +526,7 @@ def _payload_row(r: JsonRecord) -> Row:
     }
 
 
-def load_starlink(conn: sqlite3.Connection, rows: List[JsonRecord]) -> None:
+def load_starlink(conn: sqlite3.Connection, rows: list[JsonRecord]) -> None:
     conn.executemany(
         """
         INSERT INTO starlink (
@@ -572,7 +573,7 @@ def _starlink_row(r: JsonRecord) -> Row:
     }
 
 
-LOADERS: Dict[str, Callable[[sqlite3.Connection, List[JsonRecord]], None]] = {
+LOADERS: dict[str, Callable[[sqlite3.Connection, list[JsonRecord]], None]] = {
     "rockets": load_rockets,
     "launchpads": load_launchpads,
     "landpads": load_landpads,

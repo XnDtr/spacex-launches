@@ -8,9 +8,8 @@ as on a laptop.
 import copy
 import sqlite3
 
-import pytest
-
 import ingest
+import pytest
 from fixtures import FIXTURES
 
 
