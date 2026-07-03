@@ -2,3 +2,17 @@
 # lets `import ingest` work from tests/ without a manual sys.path hack
 pythonpath = ["scripts"]
 testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 110
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP"]
+
+[tool.mypy]
+python_version = "3.12"
+ignore_missing_imports = true
+warn_unused_ignores = true
+warn_redundant_casts = true
+files = ["scripts", "analysis"]
