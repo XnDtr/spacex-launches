@@ -1,0 +1,436 @@
+"""Download SpaceX API v4 data and load it into a normalized SQLite database.
+
+Usage:
+    python scripts/ingest.py [--db spacex.db]
+
+Idempotency strategy
+---------------------
+Every top-level entity (rockets, launchpads, landpads, capsules, cores,
+launches, payloads, starlink) is keyed by its natural API id and loaded with
+``INSERT ... ON CONFLICT(id) DO UPDATE``, so re-running the script updates
+existing rows in place instead of duplicating them.
+
+Child/junction rows (launch_failures, launch_cores, launch_capsules,
+payload_customers, payload_nationalities) have no natural single-column key —
+a launch's list of failures or cores can change shape between runs. For those,
+each parent's existing child rows are deleted and reinserted from the current
+API response inside the same transaction, which is equivalent to an upsert at
+the collection level and guarantees no duplicate/stale rows survive a re-run.
+"""
+import argparse
+import pathlib
+import sqlite3
+import sys
+import time
+
+import requests
+
+BASE_URL = "https://api.spacexdata.com/v4"
+SCRIPT_DIR = pathlib.Path(__file__).resolve().parent
+SCHEMA_PATH = SCRIPT_DIR.parent / "sql" / "schema.sql"
+
+ENDPOINTS = [
+    "rockets",
+    "launchpads",
+    "landpads",
+    "capsules",
+    "cores",
+    "launches",
+    "payloads",
+    "starlink",
+]
+
+
+def fetch(endpoint: str, retries: int = 3, backoff: float = 2.0) -> requests.Response:
+    """GET an endpoint with retries; returns the raw Response (caller reads .content/.json())."""
+    url = f"{BASE_URL}/{endpoint}"
+    last_error = None
+    for attempt in range(1, retries + 1):
+        try:
+            resp = requests.get(url, timeout=30)
+            resp.raise_for_status()
+            return resp
+        except requests.RequestException as exc:
+            last_error = exc
+            if attempt < retries:
+                time.sleep(backoff * attempt)
+    raise RuntimeError(f"Failed to fetch {url} after {retries} attempts: {last_error}")
+
+
+def init_schema(conn: sqlite3.Connection) -> None:
+    conn.executescript(SCHEMA_PATH.read_text())
+
+
+def load_rockets(conn, rows):
+    conn.executemany(
+        """
+        INSERT INTO rockets (
+            rocket_id, name, type, active, stages, boosters, cost_per_launch,
+            success_rate_pct, first_flight, country, company, height_m,
+            diameter_m, mass_kg, description
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(rocket_id) DO UPDATE SET
+            name=excluded.name, type=excluded.type, active=excluded.active,
+            stages=excluded.stages, boosters=excluded.boosters,
+            cost_per_launch=excluded.cost_per_launch,
+            success_rate_pct=excluded.success_rate_pct,
+            first_flight=excluded.first_flight, country=excluded.country,
+            company=excluded.company, height_m=excluded.height_m,
+            diameter_m=excluded.diameter_m, mass_kg=excluded.mass_kg,
+            description=excluded.description
+        """,
+        [
+            (
+                r["id"], r.get("name"), r.get("type"), int(bool(r.get("active"))),
+                r.get("stages"), r.get("boosters"), r.get("cost_per_launch"),
+                r.get("success_rate_pct"), r.get("first_flight"), r.get("country"),
+                r.get("company"), (r.get("height") or {}).get("meters"),
+                (r.get("diameter") or {}).get("meters"), (r.get("mass") or {}).get("kg"),
+                r.get("description"),
+            )
+            for r in rows
+        ],
+    )
+
+
+def load_launchpads(conn, rows):
+    conn.executemany(
+        """
+        INSERT INTO launchpads (
+            launchpad_id, name, full_name, locality, region, latitude,
+            longitude, launch_attempts, launch_successes, status, details
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(launchpad_id) DO UPDATE SET
+            name=excluded.name, full_name=excluded.full_name,
+            locality=excluded.locality, region=excluded.region,
+            latitude=excluded.latitude, longitude=excluded.longitude,
+            launch_attempts=excluded.launch_attempts,
+            launch_successes=excluded.launch_successes,
+            status=excluded.status, details=excluded.details
+        """,
+        [
+            (
+                r["id"], r.get("name"), r.get("full_name"), r.get("locality"),
+                r.get("region"), r.get("latitude"), r.get("longitude"),
+                r.get("launch_attempts"), r.get("launch_successes"),
+                r.get("status"), r.get("details"),
+            )
+            for r in rows
+        ],
+    )
+
+
+def load_landpads(conn, rows):
+    conn.executemany(
+        """
+        INSERT INTO landpads (
+            landpad_id, name, full_name, type, locality, region, latitude,
+            longitude, landing_attempts, landing_successes, status,
+            wikipedia, details
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(landpad_id) DO UPDATE SET
+            name=excluded.name, full_name=excluded.full_name,
+            type=excluded.type, locality=excluded.locality,
+            region=excluded.region, latitude=excluded.latitude,
+            longitude=excluded.longitude,
+            landing_attempts=excluded.landing_attempts,
+            landing_successes=excluded.landing_successes,
+            status=excluded.status, wikipedia=excluded.wikipedia,
+            details=excluded.details
+        """,
+        [
+            (
+                r["id"], r.get("name"), r.get("full_name"), r.get("type"),
+                r.get("locality"), r.get("region"), r.get("latitude"),
+                r.get("longitude"), r.get("landing_attempts"),
+                r.get("landing_successes"), r.get("status"),
+                r.get("wikipedia"), r.get("details"),
+            )
+            for r in rows
+        ],
+    )
+
+
+def load_capsules(conn, rows):
+    conn.executemany(
+        """
+        INSERT INTO capsules (
+            capsule_id, serial, status, type, reuse_count, water_landings,
+            land_landings, last_update
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(capsule_id) DO UPDATE SET
+            serial=excluded.serial, status=excluded.status,
+            type=excluded.type, reuse_count=excluded.reuse_count,
+            water_landings=excluded.water_landings,
+            land_landings=excluded.land_landings,
+            last_update=excluded.last_update
+        """,
+        [
+            (
+                r["id"], r.get("serial"), r.get("status"), r.get("type"),
+                r.get("reuse_count"), r.get("water_landings"),
+                r.get("land_landings"), r.get("last_update"),
+            )
+            for r in rows
+        ],
+    )
+
+
+def load_cores(conn, rows):
+    conn.executemany(
+        """
+        INSERT INTO cores (
+            core_id, serial, block, status, reuse_count, rtls_attempts,
+            rtls_landings, asds_attempts, asds_landings, last_update
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(core_id) DO UPDATE SET
+            serial=excluded.serial, block=excluded.block,
+            status=excluded.status, reuse_count=excluded.reuse_count,
+            rtls_attempts=excluded.rtls_attempts,
+            rtls_landings=excluded.rtls_landings,
+            asds_attempts=excluded.asds_attempts,
+            asds_landings=excluded.asds_landings,
+            last_update=excluded.last_update
+        """,
+        [
+            (
+                r["id"], r.get("serial"), r.get("block"), r.get("status"),
+                r.get("reuse_count"), r.get("rtls_attempts"),
+                r.get("rtls_landings"), r.get("asds_attempts"),
+                r.get("asds_landings"), r.get("last_update"),
+            )
+            for r in rows
+        ],
+    )
+
+
+def load_launches(conn, rows):
+    conn.executemany(
+        """
+        INSERT INTO launches (
+            launch_id, flight_number, name, date_utc, date_unix,
+            date_precision, static_fire_date_utc, tbd, net,
+            launch_window_sec, rocket_id, launchpad_id, success, upcoming,
+            details, fairings_reused, fairings_recovery_attempt,
+            fairings_recovered, patch_small, patch_large, webcast_url,
+            article_url, wikipedia_url
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(launch_id) DO UPDATE SET
+            flight_number=excluded.flight_number, name=excluded.name,
+            date_utc=excluded.date_utc, date_unix=excluded.date_unix,
+            date_precision=excluded.date_precision,
+            static_fire_date_utc=excluded.static_fire_date_utc,
+            tbd=excluded.tbd, net=excluded.net,
+            launch_window_sec=excluded.launch_window_sec,
+            rocket_id=excluded.rocket_id, launchpad_id=excluded.launchpad_id,
+            success=excluded.success, upcoming=excluded.upcoming,
+            details=excluded.details, fairings_reused=excluded.fairings_reused,
+            fairings_recovery_attempt=excluded.fairings_recovery_attempt,
+            fairings_recovered=excluded.fairings_recovered,
+            patch_small=excluded.patch_small, patch_large=excluded.patch_large,
+            webcast_url=excluded.webcast_url, article_url=excluded.article_url,
+            wikipedia_url=excluded.wikipedia_url
+        """,
+        [_launch_row(r) for r in rows],
+    )
+
+    # child collections: delete-then-reinsert per launch for idempotency
+    failure_rows, core_rows, capsule_rows = [], [], []
+    for r in rows:
+        lid = r["id"]
+        conn.execute("DELETE FROM launch_failures WHERE launch_id = ?", (lid,))
+        conn.execute("DELETE FROM launch_cores WHERE launch_id = ?", (lid,))
+        conn.execute("DELETE FROM launch_capsules WHERE launch_id = ?", (lid,))
+
+        for f in r.get("failures") or []:
+            failure_rows.append((lid, f.get("time"), f.get("altitude"), f.get("reason")))
+
+        for c in r.get("cores") or []:
+            core_rows.append(
+                (
+                    lid, c.get("core"), c.get("flight"), int(bool(c.get("gridfins"))),
+                    int(bool(c.get("legs"))), int(bool(c.get("reused"))),
+                    int(bool(c.get("landing_attempt"))),
+                    int(bool(c.get("landing_success"))) if c.get("landing_success") is not None else None,
+                    c.get("landing_type"), c.get("landpad"),
+                )
+            )
+
+        for cap_id in r.get("capsules") or []:
+            capsule_rows.append((lid, cap_id))
+
+    if failure_rows:
+        conn.executemany(
+            "INSERT OR IGNORE INTO launch_failures (launch_id, time_sec, altitude_km, reason) VALUES (?, ?, ?, ?)",
+            failure_rows,
+        )
+    if core_rows:
+        conn.executemany(
+            """
+            INSERT OR IGNORE INTO launch_cores (
+                launch_id, core_id, core_flight_num, gridfins, legs, reused,
+                landing_attempt, landing_success, landing_type, landpad_id
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            core_rows,
+        )
+    if capsule_rows:
+        conn.executemany(
+            "INSERT OR IGNORE INTO launch_capsules (launch_id, capsule_id) VALUES (?, ?)",
+            capsule_rows,
+        )
+
+
+def _launch_row(r):
+    fairings = r.get("fairings") or {}
+    links = r.get("links") or {}
+    patch = links.get("patch") or {}
+    return (
+        r["id"], r.get("flight_number"), r.get("name"), r.get("date_utc"),
+        r.get("date_unix"), r.get("date_precision"), r.get("static_fire_date_utc"),
+        int(bool(r.get("tbd"))), int(bool(r.get("net"))), r.get("window"),
+        r.get("rocket"), r.get("launchpad"),
+        None if r.get("success") is None else int(bool(r.get("success"))),
+        int(bool(r.get("upcoming"))), r.get("details"),
+        int(bool(fairings.get("reused"))) if fairings.get("reused") is not None else None,
+        int(bool(fairings.get("recovery_attempt"))) if fairings.get("recovery_attempt") is not None else None,
+        int(bool(fairings.get("recovered"))) if fairings.get("recovered") is not None else None,
+        patch.get("small"), patch.get("large"), links.get("webcast"),
+        links.get("article"), links.get("wikipedia"),
+    )
+
+
+def load_payloads(conn, rows):
+    conn.executemany(
+        """
+        INSERT INTO payloads (
+            payload_id, name, type, launch_id, reused, mass_kg, orbit,
+            reference_system, regime, longitude, semi_major_axis_km,
+            eccentricity, periapsis_km, apoapsis_km, inclination_deg,
+            period_min, lifespan_years
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(payload_id) DO UPDATE SET
+            name=excluded.name, type=excluded.type, launch_id=excluded.launch_id,
+            reused=excluded.reused, mass_kg=excluded.mass_kg,
+            orbit=excluded.orbit, reference_system=excluded.reference_system,
+            regime=excluded.regime, longitude=excluded.longitude,
+            semi_major_axis_km=excluded.semi_major_axis_km,
+            eccentricity=excluded.eccentricity, periapsis_km=excluded.periapsis_km,
+            apoapsis_km=excluded.apoapsis_km, inclination_deg=excluded.inclination_deg,
+            period_min=excluded.period_min, lifespan_years=excluded.lifespan_years
+        """,
+        [_payload_row(r) for r in rows],
+    )
+
+    customer_rows, nationality_rows = [], []
+    for r in rows:
+        pid = r["id"]
+        conn.execute("DELETE FROM payload_customers WHERE payload_id = ?", (pid,))
+        conn.execute("DELETE FROM payload_nationalities WHERE payload_id = ?", (pid,))
+        for c in r.get("customers") or []:
+            customer_rows.append((pid, c))
+        for n in r.get("nationalities") or []:
+            nationality_rows.append((pid, n))
+
+    if customer_rows:
+        conn.executemany(
+            "INSERT OR IGNORE INTO payload_customers (payload_id, customer) VALUES (?, ?)",
+            customer_rows,
+        )
+    if nationality_rows:
+        conn.executemany(
+            "INSERT OR IGNORE INTO payload_nationalities (payload_id, nationality) VALUES (?, ?)",
+            nationality_rows,
+        )
+
+
+def _payload_row(r):
+    orbit_params = r.get("orbit_params") or {}
+    launch = r.get("launch")
+    return (
+        r["id"], r.get("name"), r.get("type"), launch,
+        int(bool(r.get("reused"))), r.get("mass_kg"), r.get("orbit"),
+        orbit_params.get("reference_system"), orbit_params.get("regime"),
+        orbit_params.get("longitude"), orbit_params.get("semi_major_axis_km"),
+        orbit_params.get("eccentricity"), orbit_params.get("periapsis_km"),
+        orbit_params.get("apoapsis_km"), orbit_params.get("inclination_deg"),
+        orbit_params.get("period_min"), orbit_params.get("lifespan_years"),
+    )
+
+
+def load_starlink(conn, rows):
+    conn.executemany(
+        """
+        INSERT INTO starlink (
+            starlink_id, version, launch_id, longitude, latitude, height_km,
+            velocity_kms, object_name, object_id, norad_cat_id, launch_date,
+            country_code, epoch, mean_motion, eccentricity, inclination_deg,
+            period_min, semimajor_axis_km, decayed, decay_date
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(starlink_id) DO UPDATE SET
+            version=excluded.version, launch_id=excluded.launch_id,
+            longitude=excluded.longitude, latitude=excluded.latitude,
+            height_km=excluded.height_km, velocity_kms=excluded.velocity_kms,
+            object_name=excluded.object_name, object_id=excluded.object_id,
+            norad_cat_id=excluded.norad_cat_id, launch_date=excluded.launch_date,
+            country_code=excluded.country_code, epoch=excluded.epoch,
+            mean_motion=excluded.mean_motion, eccentricity=excluded.eccentricity,
+            inclination_deg=excluded.inclination_deg, period_min=excluded.period_min,
+            semimajor_axis_km=excluded.semimajor_axis_km, decayed=excluded.decayed,
+            decay_date=excluded.decay_date
+        """,
+        [_starlink_row(r) for r in rows],
+    )
+
+
+def _starlink_row(r):
+    st = r.get("spaceTrack") or {}
+    decay_date = st.get("DECAY_DATE")
+    return (
+        r["id"], r.get("version"), r.get("launch"), r.get("longitude"),
+        r.get("latitude"), r.get("height_km"), r.get("velocity_kms"),
+        st.get("OBJECT_NAME"), st.get("OBJECT_ID"), st.get("NORAD_CAT_ID"),
+        st.get("LAUNCH_DATE"), st.get("COUNTRY_CODE"), st.get("EPOCH"),
+        st.get("MEAN_MOTION"), st.get("ECCENTRICITY"), st.get("INCLINATION"),
+        st.get("PERIOD"), st.get("SEMIMAJOR_AXIS"),
+        int(bool(decay_date)), decay_date,
+    )
+
+
+LOADERS = {
+    "rockets": load_rockets,
+    "launchpads": load_launchpads,
+    "landpads": load_landpads,
+    "capsules": load_capsules,
+    "cores": load_cores,
+    "launches": load_launches,
+    "payloads": load_payloads,
+    "starlink": load_starlink,
+}
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--db", default="spacex.db", help="path to SQLite database file")
+    args = parser.parse_args()
+
+    conn = sqlite3.connect(args.db)
+    conn.execute("PRAGMA foreign_keys = ON")
+    init_schema(conn)
+
+    total_raw_bytes = 0
+    with conn:
+        for endpoint in ENDPOINTS:
+            print(f"Fetching {endpoint} ...", file=sys.stderr)
+            resp = fetch(endpoint)
+            total_raw_bytes += len(resp.content)
+            data = resp.json()
+            LOADERS[endpoint](conn, data)
+            print(f"  loaded {len(data)} {endpoint} record(s)", file=sys.stderr)
+
+    print(f"Total raw JSON downloaded: {total_raw_bytes / 1_000_000:.2f} MB", file=sys.stderr)
+    conn.close()
+
+
+if __name__ == "__main__":
+    main()
