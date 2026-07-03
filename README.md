@@ -33,7 +33,10 @@ sql/schema.sql        Normalized DDL + indexes
 sql/er_diagram.md      Mermaid ER diagram (renders on GitHub or mermaid.live)
 scripts/ingest.py       Download + transform + idempotent load into SQLite
 analysis/analysis.py    SQL + pandas/matplotlib questions, run against the DB
+tests/test_ingest.py    Offline tests: idempotency, FK joins, malformed-record handling
+.github/workflows/tests.yml   CI: runs pytest on every push/PR
 requirements.txt
+requirements-dev.txt    Adds pytest, for running the test suite locally
 ```
 
 The SQLite database file itself (`spacex.db`) and any charts are **not**
@@ -53,8 +56,26 @@ python scripts/ingest.py --db spacex.db
 ```
 
 This creates `spacex.db`, applies `sql/schema.sql`, then fetches all 8
-endpoints and loads them. It prints the total raw bytes downloaded and the row
-count loaded per endpoint.
+endpoints and loads them. It logs (to stdout and to `ingest.log`) the total
+raw bytes downloaded and the row count loaded per endpoint.
+
+For a cheap first check that credentials/network/schema all work before
+committing to the full pull, use `--limit N` to only load the first N records
+per endpoint (note: this still downloads the full response, it just truncates
+what gets written to SQLite):
+
+```bash
+python scripts/ingest.py --db /tmp/smoke.db --limit 5
+```
+
+**Malformed/unexpected records don't abort a run.** Each record is parsed
+individually; one that doesn't match the expected shape (missing field,
+unexpected type) is logged as a warning and skipped rather than crashing the
+whole endpoint's load. `validate_response()` also fails fast if an endpoint
+ever returns something other than a plain JSON array (e.g. an error page, or
+the paginated `{docs: [...]}` shape used by the API's POST `/query` variant),
+and warns if a response looks suspiciously small relative to known SpaceX
+launch history.
 
 **Idempotency:** every top-level table is keyed by the API's natural id and
 loaded via `INSERT ... ON CONFLICT DO UPDATE`. Child collections that don't
@@ -95,6 +116,22 @@ saves two PNG charts from the pandas questions to `analysis/output/`.
 
 Rationale for each is inline as a docstring above the corresponding function
 in `analysis/analysis.py`.
+
+## Tests
+
+```bash
+pip install -r requirements-dev.txt
+pytest -v
+```
+
+Runs entirely offline against synthetic fixtures (`tests/fixtures.py`) shaped
+like real API responses, so it doesn't depend on `api.spacexdata.com` being
+reachable. Covers: every table gets populated on first load, a second
+identical load doesn't change row counts, an upstream field change updates
+the existing row instead of duplicating it, a removed child item (e.g. a
+launch failure that no longer appears upstream) doesn't survive a re-ingest,
+one malformed record doesn't take down the rest of the batch, and FK joins
+resolve. Runs on every push via `.github/workflows/tests.yml`.
 
 ## Known data quality / API notes
 
