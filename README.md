@@ -34,9 +34,11 @@ sql/er_diagram.md      Mermaid ER diagram (renders on GitHub or mermaid.live)
 scripts/ingest.py       Download + transform + idempotent load into SQLite
 analysis/analysis.py    SQL + pandas/matplotlib questions, run against the DB
 tests/test_ingest.py    Offline tests: idempotency, FK joins, malformed-record handling
-.github/workflows/tests.yml   CI: runs pytest on every push/PR
+.github/workflows/tests.yml   CI: schema validation, ruff, mypy, pytest on every push/PR
+pyproject.toml          pytest/ruff/mypy configuration
 requirements.txt
-requirements-dev.txt    Adds pytest, for running the test suite locally
+requirements-dev.txt    Adds pytest, ruff, mypy -- for local dev/checks
+LICENSE                 MIT
 ```
 
 The SQLite database file itself (`spacex.db`) and any charts are **not**
@@ -144,7 +146,44 @@ identical load doesn't change row counts, an upstream field change updates
 the existing row instead of duplicating it, a removed child item (e.g. a
 launch failure that no longer appears upstream) doesn't survive a re-ingest,
 one malformed record doesn't take down the rest of the batch, and FK joins
-resolve. Runs on every push via `.github/workflows/tests.yml`.
+resolve.
+
+Lint and type checks:
+
+```bash
+ruff check .
+mypy
+```
+
+CI (`.github/workflows/tests.yml`) runs all of the above on every push/PR,
+plus an independent check that `sql/schema.sql` builds cleanly on its own
+(not just indirectly via the Python test suite).
+
+## Sample output (synthetic data -- not real results)
+
+The output below is from a run against `tests/fixtures.py`'s synthetic data,
+included only to preview the shape/format of a run. **The numbers are made
+up** -- see [Known limitations](#known-limitations) for why real output isn't
+here yet.
+
+```
+=== Q1: Launch success rate by year ===
+year  total_launches  successful  success_rate_pct
+2018              12          12             100.0
+2019              12           9              75.0
+2020              12          11              91.7
+...
+
+=== Q3: Launchpad success-rate trend, year over year (CTE + JOIN + LAG window function) ===
+launchpad year  total_launches  success_rate_pct  pct_pt_change_vs_prev_year
+   SLC-40 2018              12             100.0                         NaN
+   SLC-40 2019              12              75.0                       -25.0
+   SLC-40 2020              12              91.7                        16.7
+...
+
+Saved chart: analysis/output/q4_payload_mass_by_orbit.png
+Saved chart: analysis/output/q5_starlink_altitude_cadence.png
+```
 
 ## Known data quality / API notes
 
@@ -152,13 +191,36 @@ resolve. Runs on every push via `.github/workflows/tests.yml`.
   are legitimately `NULL` for upcoming or partially-documented missions —
   queries use `NULLIF`/`WHERE ... IS NOT NULL` rather than assuming non-null.
 - `payloads.mass_kg` and `orbit_params.*` are occasionally null for classified
-  (e.g. some national-security) payloads; those rows are excluded from Q3
+  (e.g. some national-security) payloads; those rows are excluded from Q4
   rather than coerced to 0.
 - The hosted API occasionally returns transient 5xx/handshake errors under
   some network paths even while its public status page shows fully
   operational — `scripts/ingest.py` retries each endpoint up to 3x with
   backoff. If ingestion fails outright, check https://status.spacexdata.com
   first before assuming a script bug.
+
+## Known limitations
+
+- **This project has not yet been run against the live API.** Every claim
+  above (row counts, the >=10MB raw size target, the analysis results) has
+  only been exercised against synthetic fixtures that mimic the real API's
+  shape. The ingestion script is designed to work unmodified against the live
+  endpoint, but "designed to" isn't "verified to" -- treat this repo as
+  code-complete but not yet data-verified until `ingest.py` has been run for
+  real and the numbers above have been replaced with actual output.
+- **No deletion/sync semantics for top-level entities.** `ingest.py` only
+  ever upserts rockets/launchpads/landpads/capsules/cores/launches/payloads/
+  starlink rows -- if a record ever disappeared from the upstream API
+  entirely (as opposed to just changing fields), the corresponding local row
+  would persist indefinitely rather than being removed. This is a deliberate
+  scope decision, not an oversight: SpaceX's launch history is effectively
+  append-only (a rocket doesn't get un-built, a launch that happened doesn't
+  get un-launched), so full snapshot-sync-with-deletion would add real
+  complexity (cascading deletes across every child/junction table) for a
+  scenario that doesn't realistically occur in this dataset. Child
+  collections (a launch's failures/cores/capsules, a payload's
+  customers/nationalities) *do* get this treatment, via delete-then-reinsert
+  per parent, because those genuinely do change shape between runs.
 
 ## Tech choices
 
