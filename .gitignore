@@ -1,0 +1,17 @@
+__pycache__/
+*.pyc
+.venv/
+venv/
+*.egg-info/
+
+# generated database and raw API cache — script the download instead
+*.db
+*.sqlite
+*.sqlite3
+data/raw/
+
+# exercise prompt, not part of the deliverable
+DATA-Technical Exercise-020726-194640.pdf
+
+.ipynb_checkpoints/
+.DS_Store
