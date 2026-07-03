@@ -16,20 +16,33 @@ a launch's list of failures or cores can change shape between runs. For those,
 each parent's existing child rows are deleted and reinserted from the current
 API response inside the same transaction, which is equivalent to an upsert at
 the collection level and guarantees no duplicate/stale rows survive a re-run.
+
+Row construction
+-----------------
+Each `_*_row()` mapper returns a dict keyed by column name, and every INSERT
+uses named (`:column`) placeholders rather than positional `?` ones. This
+means adding, removing, or reordering a column in schema.sql can't silently
+misalign with a hand-maintained positional tuple -- a typo in a dict key
+raises immediately instead of writing a value into the wrong column.
 """
 import argparse
 import logging
 import pathlib
 import sqlite3
 import time
+from typing import Any, Callable, Dict, List, Optional
 
 import requests
+
+JsonRecord = Dict[str, Any]
+Row = Dict[str, Any]
+RowMapper = Callable[[JsonRecord], Row]
 
 BASE_URL = "https://api.spacexdata.com/v4"
 SCRIPT_DIR = pathlib.Path(__file__).resolve().parent
 SCHEMA_PATH = SCRIPT_DIR.parent / "sql" / "schema.sql"
 
-ENDPOINTS = [
+ENDPOINTS: List[str] = [
     "rockets",
     "launchpads",
     "landpads",
@@ -43,7 +56,7 @@ ENDPOINTS = [
 # Rough floors used only to flag a suspiciously small response (e.g. an error
 # page or an empty result) -- not validated against a live pull, so treat as
 # a sanity check to revisit once real counts are known.
-MIN_EXPECTED_COUNTS = {
+MIN_EXPECTED_COUNTS: Dict[str, int] = {
     "rockets": 1,
     "launchpads": 1,
     "landpads": 1,
@@ -74,7 +87,7 @@ def configure_logging(log_file: str) -> None:
 def fetch(endpoint: str, retries: int = 3, backoff: float = 2.0) -> requests.Response:
     """GET an endpoint with retries; returns the raw Response (caller reads .content/.json())."""
     url = f"{BASE_URL}/{endpoint}"
-    last_error = None
+    last_error: Optional[Exception] = None
     for attempt in range(1, retries + 1):
         try:
             resp = requests.get(url, timeout=30)
@@ -88,7 +101,7 @@ def fetch(endpoint: str, retries: int = 3, backoff: float = 2.0) -> requests.Res
     raise RuntimeError(f"Failed to fetch {url} after {retries} attempts: {last_error}")
 
 
-def validate_response(endpoint: str, data) -> None:
+def validate_response(endpoint: str, data: Any) -> None:
     """Fail loudly on a shape we don't expect; warn on a suspiciously small payload.
 
     The v4 GET-all endpoints this script uses return a plain JSON array. If
@@ -111,10 +124,10 @@ def validate_response(endpoint: str, data) -> None:
         )
 
 
-def safe_map(rows: list, mapper, endpoint: str) -> list:
+def safe_map(rows: List[JsonRecord], mapper: RowMapper, endpoint: str) -> List[Row]:
     """Apply mapper to each row, logging and skipping any record that doesn't
     match our assumptions instead of aborting the whole endpoint's load."""
-    mapped = []
+    mapped: List[Row] = []
     skipped = 0
     for r in rows:
         try:
@@ -135,14 +148,18 @@ def init_schema(conn: sqlite3.Connection) -> None:
     conn.executescript(SCHEMA_PATH.read_text())
 
 
-def load_rockets(conn, rows):
+def load_rockets(conn: sqlite3.Connection, rows: List[JsonRecord]) -> None:
     conn.executemany(
         """
         INSERT INTO rockets (
             rocket_id, name, type, active, stages, boosters, cost_per_launch,
             success_rate_pct, first_flight, country, company, height_m,
             diameter_m, mass_kg, description
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ) VALUES (
+            :rocket_id, :name, :type, :active, :stages, :boosters, :cost_per_launch,
+            :success_rate_pct, :first_flight, :country, :company, :height_m,
+            :diameter_m, :mass_kg, :description
+        )
         ON CONFLICT(rocket_id) DO UPDATE SET
             name=excluded.name, type=excluded.type, active=excluded.active,
             stages=excluded.stages, boosters=excluded.boosters,
@@ -151,59 +168,70 @@ def load_rockets(conn, rows):
             first_flight=excluded.first_flight, country=excluded.country,
             company=excluded.company, height_m=excluded.height_m,
             diameter_m=excluded.diameter_m, mass_kg=excluded.mass_kg,
-            description=excluded.description
+            description=excluded.description, last_ingested_at=CURRENT_TIMESTAMP
         """,
         safe_map(rows, _rocket_row, "rockets"),
     )
 
 
-def _rocket_row(r):
-    return (
-        r["id"], r.get("name"), r.get("type"), int(bool(r.get("active"))),
-        r.get("stages"), r.get("boosters"), r.get("cost_per_launch"),
-        r.get("success_rate_pct"), r.get("first_flight"), r.get("country"),
-        r.get("company"), (r.get("height") or {}).get("meters"),
-        (r.get("diameter") or {}).get("meters"), (r.get("mass") or {}).get("kg"),
-        r.get("description"),
-    )
+def _rocket_row(r: JsonRecord) -> Row:
+    return {
+        "rocket_id": r["id"], "name": r.get("name"), "type": r.get("type"),
+        "active": int(bool(r.get("active"))), "stages": r.get("stages"),
+        "boosters": r.get("boosters"), "cost_per_launch": r.get("cost_per_launch"),
+        "success_rate_pct": r.get("success_rate_pct"), "first_flight": r.get("first_flight"),
+        "country": r.get("country"), "company": r.get("company"),
+        "height_m": (r.get("height") or {}).get("meters"),
+        "diameter_m": (r.get("diameter") or {}).get("meters"),
+        "mass_kg": (r.get("mass") or {}).get("kg"), "description": r.get("description"),
+    }
 
 
-def load_launchpads(conn, rows):
+def load_launchpads(conn: sqlite3.Connection, rows: List[JsonRecord]) -> None:
     conn.executemany(
         """
         INSERT INTO launchpads (
             launchpad_id, name, full_name, locality, region, latitude,
             longitude, launch_attempts, launch_successes, status, details
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ) VALUES (
+            :launchpad_id, :name, :full_name, :locality, :region, :latitude,
+            :longitude, :launch_attempts, :launch_successes, :status, :details
+        )
         ON CONFLICT(launchpad_id) DO UPDATE SET
             name=excluded.name, full_name=excluded.full_name,
             locality=excluded.locality, region=excluded.region,
             latitude=excluded.latitude, longitude=excluded.longitude,
             launch_attempts=excluded.launch_attempts,
             launch_successes=excluded.launch_successes,
-            status=excluded.status, details=excluded.details
+            status=excluded.status, details=excluded.details,
+            last_ingested_at=CURRENT_TIMESTAMP
         """,
         safe_map(rows, _launchpad_row, "launchpads"),
     )
 
 
-def _launchpad_row(r):
-    return (
-        r["id"], r.get("name"), r.get("full_name"), r.get("locality"),
-        r.get("region"), r.get("latitude"), r.get("longitude"),
-        r.get("launch_attempts"), r.get("launch_successes"),
-        r.get("status"), r.get("details"),
-    )
+def _launchpad_row(r: JsonRecord) -> Row:
+    return {
+        "launchpad_id": r["id"], "name": r.get("name"), "full_name": r.get("full_name"),
+        "locality": r.get("locality"), "region": r.get("region"),
+        "latitude": r.get("latitude"), "longitude": r.get("longitude"),
+        "launch_attempts": r.get("launch_attempts"), "launch_successes": r.get("launch_successes"),
+        "status": r.get("status"), "details": r.get("details"),
+    }
 
 
-def load_landpads(conn, rows):
+def load_landpads(conn: sqlite3.Connection, rows: List[JsonRecord]) -> None:
     conn.executemany(
         """
         INSERT INTO landpads (
             landpad_id, name, full_name, type, locality, region, latitude,
             longitude, landing_attempts, landing_successes, status,
             wikipedia, details
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ) VALUES (
+            :landpad_id, :name, :full_name, :type, :locality, :region, :latitude,
+            :longitude, :landing_attempts, :landing_successes, :status,
+            :wikipedia, :details
+        )
         ON CONFLICT(landpad_id) DO UPDATE SET
             name=excluded.name, full_name=excluded.full_name,
             type=excluded.type, locality=excluded.locality,
@@ -212,55 +240,63 @@ def load_landpads(conn, rows):
             landing_attempts=excluded.landing_attempts,
             landing_successes=excluded.landing_successes,
             status=excluded.status, wikipedia=excluded.wikipedia,
-            details=excluded.details
+            details=excluded.details, last_ingested_at=CURRENT_TIMESTAMP
         """,
         safe_map(rows, _landpad_row, "landpads"),
     )
 
 
-def _landpad_row(r):
-    return (
-        r["id"], r.get("name"), r.get("full_name"), r.get("type"),
-        r.get("locality"), r.get("region"), r.get("latitude"),
-        r.get("longitude"), r.get("landing_attempts"),
-        r.get("landing_successes"), r.get("status"),
-        r.get("wikipedia"), r.get("details"),
-    )
+def _landpad_row(r: JsonRecord) -> Row:
+    return {
+        "landpad_id": r["id"], "name": r.get("name"), "full_name": r.get("full_name"),
+        "type": r.get("type"), "locality": r.get("locality"), "region": r.get("region"),
+        "latitude": r.get("latitude"), "longitude": r.get("longitude"),
+        "landing_attempts": r.get("landing_attempts"),
+        "landing_successes": r.get("landing_successes"), "status": r.get("status"),
+        "wikipedia": r.get("wikipedia"), "details": r.get("details"),
+    }
 
 
-def load_capsules(conn, rows):
+def load_capsules(conn: sqlite3.Connection, rows: List[JsonRecord]) -> None:
     conn.executemany(
         """
         INSERT INTO capsules (
             capsule_id, serial, status, type, reuse_count, water_landings,
             land_landings, last_update
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        ) VALUES (
+            :capsule_id, :serial, :status, :type, :reuse_count, :water_landings,
+            :land_landings, :last_update
+        )
         ON CONFLICT(capsule_id) DO UPDATE SET
             serial=excluded.serial, status=excluded.status,
             type=excluded.type, reuse_count=excluded.reuse_count,
             water_landings=excluded.water_landings,
             land_landings=excluded.land_landings,
-            last_update=excluded.last_update
+            last_update=excluded.last_update, last_ingested_at=CURRENT_TIMESTAMP
         """,
         safe_map(rows, _capsule_row, "capsules"),
     )
 
 
-def _capsule_row(r):
-    return (
-        r["id"], r.get("serial"), r.get("status"), r.get("type"),
-        r.get("reuse_count"), r.get("water_landings"),
-        r.get("land_landings"), r.get("last_update"),
-    )
+def _capsule_row(r: JsonRecord) -> Row:
+    return {
+        "capsule_id": r["id"], "serial": r.get("serial"), "status": r.get("status"),
+        "type": r.get("type"), "reuse_count": r.get("reuse_count"),
+        "water_landings": r.get("water_landings"), "land_landings": r.get("land_landings"),
+        "last_update": r.get("last_update"),
+    }
 
 
-def load_cores(conn, rows):
+def load_cores(conn: sqlite3.Connection, rows: List[JsonRecord]) -> None:
     conn.executemany(
         """
         INSERT INTO cores (
             core_id, serial, block, status, reuse_count, rtls_attempts,
             rtls_landings, asds_attempts, asds_landings, last_update
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ) VALUES (
+            :core_id, :serial, :block, :status, :reuse_count, :rtls_attempts,
+            :rtls_landings, :asds_attempts, :asds_landings, :last_update
+        )
         ON CONFLICT(core_id) DO UPDATE SET
             serial=excluded.serial, block=excluded.block,
             status=excluded.status, reuse_count=excluded.reuse_count,
@@ -268,22 +304,23 @@ def load_cores(conn, rows):
             rtls_landings=excluded.rtls_landings,
             asds_attempts=excluded.asds_attempts,
             asds_landings=excluded.asds_landings,
-            last_update=excluded.last_update
+            last_update=excluded.last_update, last_ingested_at=CURRENT_TIMESTAMP
         """,
         safe_map(rows, _core_row, "cores"),
     )
 
 
-def _core_row(r):
-    return (
-        r["id"], r.get("serial"), r.get("block"), r.get("status"),
-        r.get("reuse_count"), r.get("rtls_attempts"),
-        r.get("rtls_landings"), r.get("asds_attempts"),
-        r.get("asds_landings"), r.get("last_update"),
-    )
+def _core_row(r: JsonRecord) -> Row:
+    return {
+        "core_id": r["id"], "serial": r.get("serial"), "block": r.get("block"),
+        "status": r.get("status"), "reuse_count": r.get("reuse_count"),
+        "rtls_attempts": r.get("rtls_attempts"), "rtls_landings": r.get("rtls_landings"),
+        "asds_attempts": r.get("asds_attempts"), "asds_landings": r.get("asds_landings"),
+        "last_update": r.get("last_update"),
+    }
 
 
-def load_launches(conn, rows):
+def load_launches(conn: sqlite3.Connection, rows: List[JsonRecord]) -> None:
     conn.executemany(
         """
         INSERT INTO launches (
@@ -293,7 +330,14 @@ def load_launches(conn, rows):
             details, fairings_reused, fairings_recovery_attempt,
             fairings_recovered, patch_small, patch_large, webcast_url,
             article_url, wikipedia_url
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ) VALUES (
+            :launch_id, :flight_number, :name, :date_utc, :date_unix,
+            :date_precision, :static_fire_date_utc, :tbd, :net,
+            :launch_window_sec, :rocket_id, :launchpad_id, :success, :upcoming,
+            :details, :fairings_reused, :fairings_recovery_attempt,
+            :fairings_recovered, :patch_small, :patch_large, :webcast_url,
+            :article_url, :wikipedia_url
+        )
         ON CONFLICT(launch_id) DO UPDATE SET
             flight_number=excluded.flight_number, name=excluded.name,
             date_utc=excluded.date_utc, date_unix=excluded.date_unix,
@@ -308,13 +352,15 @@ def load_launches(conn, rows):
             fairings_recovered=excluded.fairings_recovered,
             patch_small=excluded.patch_small, patch_large=excluded.patch_large,
             webcast_url=excluded.webcast_url, article_url=excluded.article_url,
-            wikipedia_url=excluded.wikipedia_url
+            wikipedia_url=excluded.wikipedia_url, last_ingested_at=CURRENT_TIMESTAMP
         """,
         safe_map(rows, _launch_row, "launches"),
     )
 
     # child collections: delete-then-reinsert per launch for idempotency
-    failure_rows, core_rows, capsule_rows = [], [], []
+    failure_rows: List[Row] = []
+    core_rows: List[Row] = []
+    capsule_rows: List[Row] = []
     for r in rows:
         lid = r.get("id")
         if lid is None:
@@ -325,30 +371,36 @@ def load_launches(conn, rows):
 
         for f in r.get("failures") or []:
             try:
-                failure_rows.append((lid, f.get("time"), f.get("altitude"), f.get("reason")))
+                failure_rows.append(
+                    {"launch_id": lid, "time_sec": f.get("time"),
+                     "altitude_km": f.get("altitude"), "reason": f.get("reason")}
+                )
             except AttributeError:
                 logger.warning("launches: malformed failure entry on launch_id=%s", lid)
 
         for c in r.get("cores") or []:
             try:
-                core_rows.append(
-                    (
-                        lid, c.get("core"), c.get("flight"), int(bool(c.get("gridfins"))),
-                        int(bool(c.get("legs"))), int(bool(c.get("reused"))),
-                        int(bool(c.get("landing_attempt"))),
-                        int(bool(c.get("landing_success"))) if c.get("landing_success") is not None else None,
-                        c.get("landing_type"), c.get("landpad"),
-                    )
-                )
+                core_rows.append({
+                    "launch_id": lid, "core_id": c.get("core"), "core_flight_num": c.get("flight"),
+                    "gridfins": int(bool(c.get("gridfins"))), "legs": int(bool(c.get("legs"))),
+                    "reused": int(bool(c.get("reused"))),
+                    "landing_attempt": int(bool(c.get("landing_attempt"))),
+                    "landing_success": (
+                        int(bool(c.get("landing_success")))
+                        if c.get("landing_success") is not None else None
+                    ),
+                    "landing_type": c.get("landing_type"), "landpad_id": c.get("landpad"),
+                })
             except AttributeError:
                 logger.warning("launches: malformed core entry on launch_id=%s", lid)
 
         for cap_id in r.get("capsules") or []:
-            capsule_rows.append((lid, cap_id))
+            capsule_rows.append({"launch_id": lid, "capsule_id": cap_id})
 
     if failure_rows:
         conn.executemany(
-            "INSERT OR IGNORE INTO launch_failures (launch_id, time_sec, altitude_km, reason) VALUES (?, ?, ?, ?)",
+            "INSERT OR IGNORE INTO launch_failures (launch_id, time_sec, altitude_km, reason) "
+            "VALUES (:launch_id, :time_sec, :altitude_km, :reason)",
             failure_rows,
         )
     if core_rows:
@@ -357,37 +409,51 @@ def load_launches(conn, rows):
             INSERT OR IGNORE INTO launch_cores (
                 launch_id, core_id, core_flight_num, gridfins, legs, reused,
                 landing_attempt, landing_success, landing_type, landpad_id
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (
+                :launch_id, :core_id, :core_flight_num, :gridfins, :legs, :reused,
+                :landing_attempt, :landing_success, :landing_type, :landpad_id
+            )
             """,
             core_rows,
         )
     if capsule_rows:
         conn.executemany(
-            "INSERT OR IGNORE INTO launch_capsules (launch_id, capsule_id) VALUES (?, ?)",
+            "INSERT OR IGNORE INTO launch_capsules (launch_id, capsule_id) VALUES (:launch_id, :capsule_id)",
             capsule_rows,
         )
 
 
-def _launch_row(r):
+def _launch_row(r: JsonRecord) -> Row:
     fairings = r.get("fairings") or {}
     links = r.get("links") or {}
     patch = links.get("patch") or {}
-    return (
-        r["id"], r.get("flight_number"), r.get("name"), r.get("date_utc"),
-        r.get("date_unix"), r.get("date_precision"), r.get("static_fire_date_utc"),
-        int(bool(r.get("tbd"))), int(bool(r.get("net"))), r.get("window"),
-        r.get("rocket"), r.get("launchpad"),
-        None if r.get("success") is None else int(bool(r.get("success"))),
-        int(bool(r.get("upcoming"))), r.get("details"),
-        int(bool(fairings.get("reused"))) if fairings.get("reused") is not None else None,
-        int(bool(fairings.get("recovery_attempt"))) if fairings.get("recovery_attempt") is not None else None,
-        int(bool(fairings.get("recovered"))) if fairings.get("recovered") is not None else None,
-        patch.get("small"), patch.get("large"), links.get("webcast"),
-        links.get("article"), links.get("wikipedia"),
-    )
+    return {
+        "launch_id": r["id"], "flight_number": r.get("flight_number"), "name": r.get("name"),
+        "date_utc": r.get("date_utc"), "date_unix": r.get("date_unix"),
+        "date_precision": r.get("date_precision"),
+        "static_fire_date_utc": r.get("static_fire_date_utc"),
+        "tbd": int(bool(r.get("tbd"))), "net": int(bool(r.get("net"))),
+        "launch_window_sec": r.get("window"), "rocket_id": r.get("rocket"),
+        "launchpad_id": r.get("launchpad"),
+        "success": None if r.get("success") is None else int(bool(r.get("success"))),
+        "upcoming": int(bool(r.get("upcoming"))), "details": r.get("details"),
+        "fairings_reused": (
+            int(bool(fairings.get("reused"))) if fairings.get("reused") is not None else None
+        ),
+        "fairings_recovery_attempt": (
+            int(bool(fairings.get("recovery_attempt")))
+            if fairings.get("recovery_attempt") is not None else None
+        ),
+        "fairings_recovered": (
+            int(bool(fairings.get("recovered"))) if fairings.get("recovered") is not None else None
+        ),
+        "patch_small": patch.get("small"), "patch_large": patch.get("large"),
+        "webcast_url": links.get("webcast"), "article_url": links.get("article"),
+        "wikipedia_url": links.get("wikipedia"),
+    }
 
 
-def load_payloads(conn, rows):
+def load_payloads(conn: sqlite3.Connection, rows: List[JsonRecord]) -> None:
     conn.executemany(
         """
         INSERT INTO payloads (
@@ -395,7 +461,12 @@ def load_payloads(conn, rows):
             reference_system, regime, longitude, semi_major_axis_km,
             eccentricity, periapsis_km, apoapsis_km, inclination_deg,
             period_min, lifespan_years
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ) VALUES (
+            :payload_id, :name, :type, :launch_id, :reused, :mass_kg, :orbit,
+            :reference_system, :regime, :longitude, :semi_major_axis_km,
+            :eccentricity, :periapsis_km, :apoapsis_km, :inclination_deg,
+            :period_min, :lifespan_years
+        )
         ON CONFLICT(payload_id) DO UPDATE SET
             name=excluded.name, type=excluded.type, launch_id=excluded.launch_id,
             reused=excluded.reused, mass_kg=excluded.mass_kg,
@@ -404,12 +475,14 @@ def load_payloads(conn, rows):
             semi_major_axis_km=excluded.semi_major_axis_km,
             eccentricity=excluded.eccentricity, periapsis_km=excluded.periapsis_km,
             apoapsis_km=excluded.apoapsis_km, inclination_deg=excluded.inclination_deg,
-            period_min=excluded.period_min, lifespan_years=excluded.lifespan_years
+            period_min=excluded.period_min, lifespan_years=excluded.lifespan_years,
+            last_ingested_at=CURRENT_TIMESTAMP
         """,
         safe_map(rows, _payload_row, "payloads"),
     )
 
-    customer_rows, nationality_rows = [], []
+    customer_rows: List[Row] = []
+    nationality_rows: List[Row] = []
     for r in rows:
         pid = r.get("id")
         if pid is None:
@@ -417,37 +490,42 @@ def load_payloads(conn, rows):
         conn.execute("DELETE FROM payload_customers WHERE payload_id = ?", (pid,))
         conn.execute("DELETE FROM payload_nationalities WHERE payload_id = ?", (pid,))
         for c in r.get("customers") or []:
-            customer_rows.append((pid, c))
+            customer_rows.append({"payload_id": pid, "customer": c})
         for n in r.get("nationalities") or []:
-            nationality_rows.append((pid, n))
+            nationality_rows.append({"payload_id": pid, "nationality": n})
 
     if customer_rows:
         conn.executemany(
-            "INSERT OR IGNORE INTO payload_customers (payload_id, customer) VALUES (?, ?)",
+            "INSERT OR IGNORE INTO payload_customers (payload_id, customer) VALUES (:payload_id, :customer)",
             customer_rows,
         )
     if nationality_rows:
         conn.executemany(
-            "INSERT OR IGNORE INTO payload_nationalities (payload_id, nationality) VALUES (?, ?)",
+            "INSERT OR IGNORE INTO payload_nationalities (payload_id, nationality) "
+            "VALUES (:payload_id, :nationality)",
             nationality_rows,
         )
 
 
-def _payload_row(r):
+def _payload_row(r: JsonRecord) -> Row:
     orbit_params = r.get("orbit_params") or {}
-    launch = r.get("launch")
-    return (
-        r["id"], r.get("name"), r.get("type"), launch,
-        int(bool(r.get("reused"))), r.get("mass_kg"), r.get("orbit"),
-        orbit_params.get("reference_system"), orbit_params.get("regime"),
-        orbit_params.get("longitude"), orbit_params.get("semi_major_axis_km"),
-        orbit_params.get("eccentricity"), orbit_params.get("periapsis_km"),
-        orbit_params.get("apoapsis_km"), orbit_params.get("inclination_deg"),
-        orbit_params.get("period_min"), orbit_params.get("lifespan_years"),
-    )
+    return {
+        "payload_id": r["id"], "name": r.get("name"), "type": r.get("type"),
+        "launch_id": r.get("launch"), "reused": int(bool(r.get("reused"))),
+        "mass_kg": r.get("mass_kg"), "orbit": r.get("orbit"),
+        "reference_system": orbit_params.get("reference_system"),
+        "regime": orbit_params.get("regime"), "longitude": orbit_params.get("longitude"),
+        "semi_major_axis_km": orbit_params.get("semi_major_axis_km"),
+        "eccentricity": orbit_params.get("eccentricity"),
+        "periapsis_km": orbit_params.get("periapsis_km"),
+        "apoapsis_km": orbit_params.get("apoapsis_km"),
+        "inclination_deg": orbit_params.get("inclination_deg"),
+        "period_min": orbit_params.get("period_min"),
+        "lifespan_years": orbit_params.get("lifespan_years"),
+    }
 
 
-def load_starlink(conn, rows):
+def load_starlink(conn: sqlite3.Connection, rows: List[JsonRecord]) -> None:
     conn.executemany(
         """
         INSERT INTO starlink (
@@ -455,7 +533,12 @@ def load_starlink(conn, rows):
             velocity_kms, object_name, object_id, norad_cat_id, launch_date,
             country_code, epoch, mean_motion, eccentricity, inclination_deg,
             period_min, semimajor_axis_km, decayed, decay_date
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ) VALUES (
+            :starlink_id, :version, :launch_id, :longitude, :latitude, :height_km,
+            :velocity_kms, :object_name, :object_id, :norad_cat_id, :launch_date,
+            :country_code, :epoch, :mean_motion, :eccentricity, :inclination_deg,
+            :period_min, :semimajor_axis_km, :decayed, :decay_date
+        )
         ON CONFLICT(starlink_id) DO UPDATE SET
             version=excluded.version, launch_id=excluded.launch_id,
             longitude=excluded.longitude, latitude=excluded.latitude,
@@ -466,27 +549,30 @@ def load_starlink(conn, rows):
             mean_motion=excluded.mean_motion, eccentricity=excluded.eccentricity,
             inclination_deg=excluded.inclination_deg, period_min=excluded.period_min,
             semimajor_axis_km=excluded.semimajor_axis_km, decayed=excluded.decayed,
-            decay_date=excluded.decay_date
+            decay_date=excluded.decay_date, last_ingested_at=CURRENT_TIMESTAMP
         """,
         safe_map(rows, _starlink_row, "starlink"),
     )
 
 
-def _starlink_row(r):
+def _starlink_row(r: JsonRecord) -> Row:
     st = r.get("spaceTrack") or {}
     decay_date = st.get("DECAY_DATE")
-    return (
-        r["id"], r.get("version"), r.get("launch"), r.get("longitude"),
-        r.get("latitude"), r.get("height_km"), r.get("velocity_kms"),
-        st.get("OBJECT_NAME"), st.get("OBJECT_ID"), st.get("NORAD_CAT_ID"),
-        st.get("LAUNCH_DATE"), st.get("COUNTRY_CODE"), st.get("EPOCH"),
-        st.get("MEAN_MOTION"), st.get("ECCENTRICITY"), st.get("INCLINATION"),
-        st.get("PERIOD"), st.get("SEMIMAJOR_AXIS"),
-        int(bool(decay_date)), decay_date,
-    )
+    return {
+        "starlink_id": r["id"], "version": r.get("version"), "launch_id": r.get("launch"),
+        "longitude": r.get("longitude"), "latitude": r.get("latitude"),
+        "height_km": r.get("height_km"), "velocity_kms": r.get("velocity_kms"),
+        "object_name": st.get("OBJECT_NAME"), "object_id": st.get("OBJECT_ID"),
+        "norad_cat_id": st.get("NORAD_CAT_ID"), "launch_date": st.get("LAUNCH_DATE"),
+        "country_code": st.get("COUNTRY_CODE"), "epoch": st.get("EPOCH"),
+        "mean_motion": st.get("MEAN_MOTION"), "eccentricity": st.get("ECCENTRICITY"),
+        "inclination_deg": st.get("INCLINATION"), "period_min": st.get("PERIOD"),
+        "semimajor_axis_km": st.get("SEMIMAJOR_AXIS"),
+        "decayed": int(bool(decay_date)), "decay_date": decay_date,
+    }
 
 
-LOADERS = {
+LOADERS: Dict[str, Callable[[sqlite3.Connection, List[JsonRecord]], None]] = {
     "rockets": load_rockets,
     "launchpads": load_launchpads,
     "landpads": load_landpads,
@@ -498,7 +584,7 @@ LOADERS = {
 }
 
 
-def main():
+def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--db", default="spacex.db", help="path to SQLite database file")
     parser.add_argument(
