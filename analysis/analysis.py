@@ -1,0 +1,175 @@
+"""Analysis questions over the SpaceX SQLite database built by scripts/ingest.py.
+
+Run after ingestion:
+    python analysis/analysis.py [--db spacex.db] [--out analysis/output]
+
+Produces printed tables for the SQL questions and PNG charts for the pandas
+questions in --out (default: analysis/output/).
+"""
+import argparse
+import pathlib
+import sqlite3
+
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+import pandas as pd
+
+
+def q1_success_rate_by_year(conn):
+    """Q1 (pure SQL) -- Has SpaceX's launch success rate improved over time?
+
+    Why interesting: reliability trend is the headline metric for a launch
+    provider -- customers and insurers price risk off it. Excludes upcoming
+    (not-yet-flown) launches so 'success' is only computed over resolved
+    outcomes.
+    """
+    sql = """
+        SELECT
+            substr(date_utc, 1, 4)                          AS year,
+            COUNT(*)                                         AS total_launches,
+            SUM(success)                                     AS successful,
+            ROUND(100.0 * SUM(success) / COUNT(*), 1)        AS success_rate_pct
+        FROM launches
+        WHERE upcoming = 0 AND success IS NOT NULL
+        GROUP BY year
+        ORDER BY year;
+    """
+    df = pd.read_sql_query(sql, conn)
+    print("\n=== Q1: Launch success rate by year ===")
+    print(sql)
+    print(df.to_string(index=False))
+    return df
+
+
+def q2_core_reuse_landing_success(conn):
+    """Q2 (pure SQL) -- Do more-reused boosters land as reliably as new ones?
+
+    Why interesting: core reuse is the core (pun intended) of SpaceX's cost
+    model. If landing success dropped off with reuse count, that would be a
+    real engineering red flag -- this checks it directly from the data.
+    """
+    sql = """
+        SELECT
+            core_flight_num,
+            COUNT(*)                                              AS attempts,
+            SUM(landing_attempt)                                  AS landing_attempts,
+            SUM(landing_success)                                  AS landing_successes,
+            ROUND(100.0 * SUM(landing_success) /
+                  NULLIF(SUM(landing_attempt), 0), 1)             AS landing_success_pct
+        FROM launch_cores
+        WHERE core_flight_num IS NOT NULL
+        GROUP BY core_flight_num
+        HAVING attempts >= 3
+        ORDER BY core_flight_num;
+    """
+    df = pd.read_sql_query(sql, conn)
+    print("\n=== Q2: Landing success rate by core flight number (1st use, 2nd use, ...) ===")
+    print(sql)
+    print(df.to_string(index=False))
+    return df
+
+
+def q3_payload_mass_by_orbit(conn, out_dir: pathlib.Path):
+    """Q3 (pandas + matplotlib) -- How has payload mass to each orbit class evolved?
+
+    Why interesting: rising mass-to-orbit for LEO/GTO over time is a direct
+    signal of Falcon 9's growing capacity (block upgrades, reuse efficiency)
+    and of the Starlink-driven shift in SpaceX's own manifest.
+    """
+    sql = """
+        SELECT l.date_utc, p.orbit, p.mass_kg
+        FROM payloads p
+        JOIN launches l ON p.launch_id = l.launch_id
+        WHERE p.mass_kg IS NOT NULL AND p.orbit IS NOT NULL AND l.upcoming = 0;
+    """
+    df = pd.read_sql_query(sql, conn, parse_dates=["date_utc"])
+    print("\n=== Q3: Payload mass by orbit over time (pandas) ===")
+    print(sql)
+    print(df.describe(include="all").to_string())
+
+    top_orbits = df["orbit"].value_counts().head(5).index
+    fig, ax = plt.subplots(figsize=(9, 5))
+    for orbit in top_orbits:
+        sub = df[df["orbit"] == orbit].sort_values("date_utc")
+        ax.scatter(sub["date_utc"], sub["mass_kg"], label=orbit, alpha=0.6, s=15)
+    ax.set_xlabel("Launch date")
+    ax.set_ylabel("Payload mass (kg)")
+    ax.set_title("Payload mass to orbit over time, by orbit class")
+    ax.legend()
+    fig.autofmt_xdate()
+    fig.tight_layout()
+    out_path = out_dir / "q3_payload_mass_by_orbit.png"
+    fig.savefig(out_path, dpi=120)
+    plt.close(fig)
+    print(f"Saved chart: {out_path}")
+    return df
+
+
+def q4_starlink_altitude_and_cadence(conn, out_dir: pathlib.Path):
+    """Q4 (pandas + matplotlib) -- What does the Starlink constellation's
+    altitude distribution look like, and how fast is it being launched?
+
+    Why interesting: Starlink is now the majority of SpaceX's launch manifest
+    and satellite count by a wide margin. Altitude clustering reflects
+    deliberate shell design (orbital-debris mitigation, coverage bands), and
+    the cadence chart shows how aggressively the constellation is being built
+    out launch-over-launch.
+    """
+    sql = """
+        SELECT s.height_km, s.launch_date, l.name AS launch_name
+        FROM starlink s
+        LEFT JOIN launches l ON s.launch_id = l.launch_id
+        WHERE s.height_km IS NOT NULL;
+    """
+    df = pd.read_sql_query(sql, conn, parse_dates=["launch_date"])
+    print("\n=== Q4: Starlink altitude distribution & launch cadence (pandas) ===")
+    print(sql)
+    print(df["height_km"].describe().to_string())
+
+    fig, axes = plt.subplots(1, 2, figsize=(12, 5))
+
+    axes[0].hist(df["height_km"].dropna(), bins=40, color="steelblue")
+    axes[0].set_xlabel("Altitude (km)")
+    axes[0].set_ylabel("Satellite count")
+    axes[0].set_title("Starlink altitude distribution")
+
+    cadence = (
+        df.dropna(subset=["launch_date"])
+        .groupby(df["launch_date"].dt.to_period("M"))
+        .size()
+    )
+    cadence.index = cadence.index.to_timestamp()
+    axes[1].plot(cadence.index, cadence.values, marker="o", markersize=3)
+    axes[1].set_xlabel("Month")
+    axes[1].set_ylabel("Satellites launched")
+    axes[1].set_title("Starlink deployment cadence")
+    fig.autofmt_xdate()
+
+    fig.tight_layout()
+    out_path = out_dir / "q4_starlink_altitude_cadence.png"
+    fig.savefig(out_path, dpi=120)
+    plt.close(fig)
+    print(f"Saved chart: {out_path}")
+    return df
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--db", default="spacex.db")
+    parser.add_argument("--out", default="analysis/output")
+    args = parser.parse_args()
+
+    out_dir = pathlib.Path(args.out)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    conn = sqlite3.connect(args.db)
+    q1_success_rate_by_year(conn)
+    q2_core_reuse_landing_success(conn)
+    q3_payload_mass_by_orbit(conn, out_dir)
+    q4_starlink_altitude_and_cadence(conn, out_dir)
+    conn.close()
+
+
+if __name__ == "__main__":
+    main()
