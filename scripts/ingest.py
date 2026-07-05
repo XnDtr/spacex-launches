@@ -1,12 +1,40 @@
-"""Download SpaceX API v4 data and load it into a normalized SQLite database.
+"""Download SpaceX-related data and load it into a normalized SQLite database.
 
 Usage:
     python scripts/ingest.py [--db spacex.db]
 
+Source strategy (see README "Known data quality" for the full story)
+----------------------------------------------------------------------
+The live SpaceX API (api.spacexdata.com) has been unreachable (Cloudflare 525
+-- origin down) since its source repo was archived; the mirror is dead too.
+Per table:
+
+- rockets, capsules, launches, payloads: fetched from a Wayback Machine
+  snapshot of the real API response (same JSON shape, so every `_*_row()`
+  mapper below is unchanged).
+- launchpads, landpads: hand-seeded (`LAUNCHPADS_SEED`/`LANDPADS_SEED`). No
+  live or archived source exists for these two endpoints; SpaceX has only
+  ever used this fixed, tiny set of physical sites, and the id -> site
+  mapping was cross-validated against real launch history in the Wayback
+  `launches` snapshot (e.g. the earliest launch on one launchpad id is
+  FalconSat/2006 -> Kwajalein; on another it's CRS-10/Feb-2017, the
+  well-documented first flight from KSC LC-39A after the Sep-2016 pad
+  explosion took SLC-40 offline).
+- cores: no live or archived source has core metadata either. `id`-only stub
+  rows are derived from the core ids referenced inside the ingested
+  `launches` data, just to satisfy the `launch_cores` foreign key -- see
+  `derive_core_stubs()`.
+- starlink: replaced with live data from Celestrak (GP orbital elements +
+  the public SATCAT), which is also what drives this project's >=10MB raw
+  size target now that the original spaceTrack-shaped source is gone. See
+  `_celestrak_to_starlink_records()` -- it reshapes Celestrak's fields into
+  the same spaceTrack-nested shape `_starlink_row()` already expects, so
+  that mapper (and its tests) are unchanged too.
+
 Idempotency strategy
 ---------------------
 Every top-level entity (rockets, launchpads, landpads, capsules, cores,
-launches, payloads, starlink) is keyed by its natural API id and loaded with
+launches, payloads, starlink) is keyed by its natural id and loaded with
 ``INSERT ... ON CONFLICT(id) DO UPDATE``, so re-running the script updates
 existing rows in place instead of duplicating them.
 
@@ -26,7 +54,10 @@ misalign with a hand-maintained positional tuple -- a typo in a dict key
 raises immediately instead of writing a value into the wrong column.
 """
 import argparse
+import csv
+import io
 import logging
+import math
 import pathlib
 import sqlite3
 import time
@@ -52,6 +83,111 @@ ENDPOINTS: list[str] = [
     "launches",
     "payloads",
     "starlink",
+]
+
+# Wayback Machine snapshot timestamps of the real (now-dead) API responses --
+# see module docstring. Format matches web.archive.org's /web/<timestamp>/ path.
+WAYBACK_SNAPSHOTS: dict[str, str] = {
+    "rockets": "20260206123459",
+    "capsules": "20260206123459",
+    "launches": "20260206123625",
+    "payloads": "20240802054003",
+}
+
+CELESTRAK_GP_URL = "https://celestrak.org/NORAD/elements/gp.php?GROUP=starlink&FORMAT=json"
+CELESTRAK_SATCAT_URL = "https://celestrak.org/pub/satcat.csv"
+
+EARTH_MU_KM3_S2 = 398600.4418  # Earth's standard gravitational parameter
+EARTH_MEAN_RADIUS_KM = 6371.0
+
+# Real, hand-verified SpaceX launch/landing sites -- see module docstring.
+LAUNCHPADS_SEED: list[JsonRecord] = [
+    {
+        "id": "5e9e4502f5090995de566f86", "name": "Kwajalein Atoll", "full_name": "Omelek Island",
+        "locality": "Kwajalein Atoll", "region": "Marshall Islands", "latitude": 9.047721,
+        "longitude": 167.743129, "launch_attempts": 5, "launch_successes": 2, "status": "retired",
+        "details": "SpaceX's first launch site, used only for Falcon 1 (2006-2009).",
+    },
+    {
+        "id": "5e9e4501f509094ba4566f84", "name": "CCSFS SLC-40",
+        "full_name": "Cape Canaveral Space Force Station Space Launch Complex 40",
+        "locality": "Cape Canaveral", "region": "Florida", "latitude": 28.561857,
+        "longitude": -80.577366, "launch_attempts": None, "launch_successes": None, "status": "active",
+        "details": "Primary East Coast Falcon 9 pad since the Falcon 9 debut in June 2010.",
+    },
+    {
+        "id": "5e9e4502f509092b78566f87", "name": "VAFB SLC-4E",
+        "full_name": "Vandenberg Space Force Base Space Launch Complex 4E",
+        "locality": "Vandenberg Space Force Base", "region": "California", "latitude": 34.632093,
+        "longitude": -120.610829, "launch_attempts": 15, "launch_successes": 15, "status": "active",
+        "details": "West Coast Falcon 9 pad. Name/location/counts confirmed via the archived "
+                   "API repo's own doc examples (docs/launchpads/v4/all.md).",
+    },
+    {
+        "id": "5e9e4502f509094188566f88", "name": "KSC LC-39A",
+        "full_name": "Kennedy Space Center Launch Complex 39A",
+        "locality": "Kennedy Space Center", "region": "Florida", "latitude": 28.608389,
+        "longitude": -80.604333, "launch_attempts": None, "launch_successes": None, "status": "active",
+        "details": "Former Apollo/Shuttle pad; SpaceX's Falcon Heavy and Crew Dragon pad since 2017.",
+    },
+]
+
+LANDPADS_SEED: list[JsonRecord] = [
+    {
+        "id": "5e9e3032383ecb267a34e7c7", "name": "LZ-1", "full_name": "Landing Zone 1",
+        "type": "RTLS", "locality": "Cape Canaveral", "region": "Florida", "latitude": 28.485833,
+        "longitude": -80.544444, "landing_attempts": None, "landing_successes": None, "status": "active",
+        "wikipedia": "https://en.wikipedia.org/wiki/Landing_Zones_1_and_2",
+        "details": "Site of the first-ever orbital-class rocket landing (Orbcomm-2, Dec 2015).",
+    },
+    {
+        "id": "5e9e3032383ecb554034e7c9", "name": "LZ-4", "full_name": "Landing Zone 4",
+        "type": "RTLS", "locality": "Vandenberg Space Force Base", "region": "California",
+        "latitude": 34.6321, "longitude": -120.6110, "landing_attempts": None,
+        "landing_successes": None, "status": "active",
+        "wikipedia": "https://en.wikipedia.org/wiki/Autonomous_spaceport_drone_ship",
+        "details": "West Coast RTLS pad; first landing was SAOCOM 1A, Oct 2018.",
+    },
+    {
+        "id": "5e9e3032383ecb90a834e7c8", "name": "LZ-2", "full_name": "Landing Zone 2",
+        "type": "RTLS", "locality": "Cape Canaveral", "region": "Florida", "latitude": 28.485833,
+        "longitude": -80.544444, "landing_attempts": 3, "landing_successes": 3, "status": "active",
+        "wikipedia": "https://en.wikipedia.org/wiki/Landing_Zones_1_and_2",
+        "details": "Falcon Heavy side-booster RTLS pad. Name/counts confirmed via the archived "
+                   "API repo's own doc examples (docs/landpads/v4/all.md).",
+    },
+    {
+        "id": "5e9e3032383ecb761634e7cb", "name": "JRTI (2015)",
+        "full_name": "Just Read the Instructions (original hull)",
+        "type": "ASDS", "locality": "Atlantic Ocean", "region": None, "latitude": None,
+        "longitude": None, "landing_attempts": None, "landing_successes": None, "status": "retired",
+        "wikipedia": "https://en.wikipedia.org/wiki/Autonomous_spaceport_drone_ship",
+        "details": "First-generation droneship; both attempts (CRS-5, CRS-6, early 2015) tipped "
+                   "over on landing. Retired later in 2015.",
+    },
+    {
+        "id": "5e9e3032383ecb6bb234e7ca", "name": "OCISLY", "full_name": "Of Course I Still Love You",
+        "type": "ASDS", "locality": "Atlantic Ocean", "region": None, "latitude": None,
+        "longitude": None, "landing_attempts": None, "landing_successes": None, "status": "active",
+        "wikipedia": "https://en.wikipedia.org/wiki/Autonomous_spaceport_drone_ship",
+        "details": "SpaceX's primary East Coast droneship, in service since 2015.",
+    },
+    {
+        "id": "5e9e3033383ecbb9e534e7cc", "name": "JRTI",
+        "full_name": "Just Read the Instructions (2016 hull)",
+        "type": "ASDS", "locality": "Pacific / Atlantic Ocean", "region": None, "latitude": None,
+        "longitude": None, "landing_attempts": None, "landing_successes": None, "status": "active",
+        "wikipedia": "https://en.wikipedia.org/wiki/Autonomous_spaceport_drone_ship",
+        "details": "Replacement droneship carrying the JRTI name since 2016; relocated between "
+                   "coasts over its service life.",
+    },
+    {
+        "id": "5e9e3033383ecb075134e7cd", "name": "ASOG", "full_name": "A Shortfall of Gravitas",
+        "type": "ASDS", "locality": "Atlantic Ocean", "region": None, "latitude": None,
+        "longitude": None, "landing_attempts": None, "landing_successes": None, "status": "active",
+        "wikipedia": "https://en.wikipedia.org/wiki/Autonomous_spaceport_drone_ship",
+        "details": "SpaceX's newest droneship, in service since 2021.",
+    },
 ]
 
 # Rough floors used only to flag a suspiciously small response (e.g. an error
@@ -85,13 +221,14 @@ def configure_logging(log_file: str) -> None:
     logger.addHandler(file_handler)
 
 
-def fetch(endpoint: str, retries: int = 3, backoff: float = 2.0) -> requests.Response:
-    """GET an endpoint with retries; returns the raw Response (caller reads .content/.json())."""
-    url = f"{BASE_URL}/{endpoint}"
+def _get_with_retries(
+    url: str, retries: int = 3, backoff: float = 2.0, timeout: int = 30
+) -> requests.Response:
+    """GET a URL with retries; returns the raw Response (caller reads .content/.json()/.text)."""
     last_error: Exception | None = None
     for attempt in range(1, retries + 1):
         try:
-            resp = requests.get(url, timeout=30)
+            resp = requests.get(url, timeout=timeout)
             resp.raise_for_status()
             return resp
         except requests.RequestException as exc:
@@ -100,6 +237,131 @@ def fetch(endpoint: str, retries: int = 3, backoff: float = 2.0) -> requests.Res
             if attempt < retries:
                 time.sleep(backoff * attempt)
     raise RuntimeError(f"Failed to fetch {url} after {retries} attempts: {last_error}")
+
+
+def fetch_wayback(endpoint: str) -> tuple[list[JsonRecord], int]:
+    """Fetch a Wayback Machine snapshot of the real (now-dead) API response.
+
+    Wayback serves the original bytes verbatim, so this is the same JSON
+    shape the live endpoint used to return -- every `_*_row()` mapper below
+    needs no changes to consume it.
+    """
+    timestamp = WAYBACK_SNAPSHOTS[endpoint]
+    url = f"https://web.archive.org/web/{timestamp}if_/{BASE_URL}/{endpoint}"
+    resp = _get_with_retries(url)
+    return resp.json(), len(resp.content)
+
+
+def fetch_celestrak_gp_starlink() -> tuple[list[JsonRecord], int]:
+    """Live current orbital elements for active Starlink satellites."""
+    resp = _get_with_retries(CELESTRAK_GP_URL, timeout=60)
+    data = resp.json()
+    if not isinstance(data, list):
+        raise RuntimeError(f"Celestrak GP starlink: expected a JSON array, got {type(data).__name__}")
+    return data, len(resp.content)
+
+
+def fetch_celestrak_satcat_starlink() -> tuple[list[dict[str, str]], int]:
+    """Live satellite catalog rows (launch/decay history) for Starlink, active + decayed."""
+    resp = _get_with_retries(CELESTRAK_SATCAT_URL, timeout=120)
+    rows = [
+        row for row in csv.DictReader(io.StringIO(resp.text))
+        if row.get("OBJECT_NAME", "").upper().startswith("STARLINK")
+    ]
+    return rows, len(resp.content)
+
+
+def derive_core_stubs(launches_data: list[JsonRecord]) -> list[JsonRecord]:
+    """No live or cached source has cores metadata (serial/block/landing counts)
+    -- see module docstring. Stub just the id for every core referenced by a
+    launch so the launch_cores foreign key resolves; every other column stays
+    null."""
+    core_ids: set[str] = set()
+    for launch in launches_data:
+        for c in launch.get("cores") or []:
+            cid = c.get("core")
+            if cid:
+                core_ids.add(cid)
+    return [{"id": cid} for cid in sorted(core_ids)]
+
+
+def _semimajor_axis_km(mean_motion_rev_per_day: float | None) -> float | None:
+    """Kepler's third law: a = (mu / n^2)^(1/3), with n converted to rad/s."""
+    if not mean_motion_rev_per_day:
+        return None
+    n_rad_s = mean_motion_rev_per_day * 2 * math.pi / 86400.0
+    return (EARTH_MU_KM3_S2 / (n_rad_s**2)) ** (1 / 3)
+
+
+def _to_float(value: str | None) -> float | None:
+    if not value:
+        return None
+    try:
+        return float(value)
+    except ValueError:
+        return None
+
+
+def _celestrak_to_starlink_records(
+    gp_rows: list[JsonRecord], satcat_rows: list[dict[str, str]]
+) -> list[JsonRecord]:
+    """Adapt live Celestrak data into the spaceTrack-nested shape `_starlink_row()`
+    already expects from the (now-dead) SpaceX API's `starlink` endpoint, so
+    that mapper (and its tests) don't need to change -- see module docstring.
+    """
+    satcat_by_object_id = {row["OBJECT_ID"]: row for row in satcat_rows if row.get("OBJECT_ID")}
+    gp_by_object_id = {row["OBJECT_ID"]: row for row in gp_rows if row.get("OBJECT_ID")}
+
+    records: list[JsonRecord] = []
+    for object_id, gp in gp_by_object_id.items():
+        sat = satcat_by_object_id.get(object_id, {})
+        mean_motion = gp.get("MEAN_MOTION")
+        semimajor = _semimajor_axis_km(mean_motion)
+        records.append({
+            "id": str(gp.get("NORAD_CAT_ID") or object_id),
+            "version": None, "launch": None, "longitude": None, "latitude": None,
+            "height_km": (semimajor - EARTH_MEAN_RADIUS_KM) if semimajor is not None else None,
+            "velocity_kms": None,
+            "spaceTrack": {
+                "OBJECT_NAME": gp.get("OBJECT_NAME"), "OBJECT_ID": object_id,
+                "NORAD_CAT_ID": gp.get("NORAD_CAT_ID"),
+                "LAUNCH_DATE": sat.get("LAUNCH_DATE") or None,
+                "COUNTRY_CODE": sat.get("OWNER") or "US",
+                "EPOCH": gp.get("EPOCH"), "MEAN_MOTION": mean_motion,
+                "ECCENTRICITY": gp.get("ECCENTRICITY"), "INCLINATION": gp.get("INCLINATION"),
+                "PERIOD": (1440.0 / mean_motion) if mean_motion else None,
+                "SEMIMAJOR_AXIS": semimajor,
+                "DECAY_DATE": sat.get("DECAY_DATE") or None,
+            },
+        })
+
+    # Decayed/no-longer-tracked satellites have no current GP element, but
+    # SATCAT still has their launch/decay history and last-known orbit --
+    # keep them (with coarser, non-propagated orbital fields) rather than
+    # silently dropping all decay history.
+    seen = set(gp_by_object_id)
+    for object_id, sat in satcat_by_object_id.items():
+        if object_id in seen:
+            continue
+        apogee, perigee = _to_float(sat.get("APOGEE")), _to_float(sat.get("PERIGEE"))
+        records.append({
+            "id": str(sat.get("NORAD_CAT_ID") or object_id),
+            "version": None, "launch": None, "longitude": None, "latitude": None,
+            "height_km": (apogee + perigee) / 2 if apogee is not None and perigee is not None else None,
+            "velocity_kms": None,
+            "spaceTrack": {
+                "OBJECT_NAME": sat.get("OBJECT_NAME"), "OBJECT_ID": object_id,
+                "NORAD_CAT_ID": sat.get("NORAD_CAT_ID"),
+                "LAUNCH_DATE": sat.get("LAUNCH_DATE") or None,
+                "COUNTRY_CODE": sat.get("OWNER") or "US",
+                "EPOCH": None, "MEAN_MOTION": None, "ECCENTRICITY": None,
+                "INCLINATION": _to_float(sat.get("INCLINATION")),
+                "PERIOD": _to_float(sat.get("PERIOD")),
+                "SEMIMAJOR_AXIS": None,
+                "DECAY_DATE": sat.get("DECAY_DATE") or None,
+            },
+        })
+    return records
 
 
 def validate_response(endpoint: str, data: Any) -> None:
@@ -455,6 +717,23 @@ def _launch_row(r: JsonRecord) -> Row:
 
 
 def load_payloads(conn: sqlite3.Connection, rows: list[JsonRecord]) -> None:
+    # rockets/capsules/launches/payloads are independently-dated Wayback
+    # snapshots (see README), so a payload can reference a launch_id that
+    # existed when the payloads snapshot was taken but is absent from the
+    # (differently-dated) launches snapshot -- e.g. a placeholder combined
+    # launch record later split/removed upstream. Null the FK rather than
+    # fail the whole load.
+    known_launch_ids = {row[0] for row in conn.execute("SELECT launch_id FROM launches")}
+    mapped = safe_map(rows, _payload_row, "payloads")
+    for row in mapped:
+        if row["launch_id"] is not None and row["launch_id"] not in known_launch_ids:
+            logger.warning(
+                "payloads: payload_id=%s references launch_id=%s, absent from the "
+                "launches snapshot (snapshot-time mismatch) -- nulling the FK",
+                row["payload_id"], row["launch_id"],
+            )
+            row["launch_id"] = None
+
     conn.executemany(
         """
         INSERT INTO payloads (
@@ -479,7 +758,7 @@ def load_payloads(conn: sqlite3.Connection, rows: list[JsonRecord]) -> None:
             period_min=excluded.period_min, lifespan_years=excluded.lifespan_years,
             last_ingested_at=CURRENT_TIMESTAMP
         """,
-        safe_map(rows, _payload_row, "payloads"),
+        mapped,
     )
 
     customer_rows: list[Row] = []
@@ -604,20 +883,98 @@ def main() -> None:
     conn.execute("PRAGMA foreign_keys = ON")
     init_schema(conn)
 
-    total_raw_bytes = 0
-    with conn:
-        for endpoint in ENDPOINTS:
-            logger.info("Fetching %s ...", endpoint)
-            resp = fetch(endpoint)
-            total_raw_bytes += len(resp.content)
-            data = resp.json()
-            validate_response(endpoint, data)
-            if args.limit is not None:
-                data = data[: args.limit]
-            LOADERS[endpoint](conn, data)
-            logger.info("  loaded %d %s record(s)", len(data), endpoint)
+    def limited(rows: list[JsonRecord]) -> list[JsonRecord]:
+        return rows if args.limit is None else rows[: args.limit]
 
-    logger.info("Total raw JSON downloaded: %.2f MB", total_raw_bytes / 1_000_000)
+    # Each table commits independently (rather than one all-or-nothing
+    # transaction for the whole run) -- sources are now heterogeneous
+    # (Wayback/hand-seeded/derived/live Celestrak), so a transient failure
+    # in one (e.g. Celestrak's throttle, see below) shouldn't force
+    # re-fetching/re-loading tables that already succeeded on retry.
+    total_raw_bytes = 0
+
+    with conn:
+        logger.info("Fetching rockets (Wayback Machine snapshot -- live API is down, see README) ...")
+        rockets, n = fetch_wayback("rockets")
+        total_raw_bytes += n
+        validate_response("rockets", rockets)
+        rockets = limited(rockets)
+        LOADERS["rockets"](conn, rockets)
+        logger.info("  loaded %d rockets record(s)", len(rockets))
+
+    with conn:
+        logger.info("Loading launchpads (hand-seeded, no live/cached source exists -- see README) ...")
+        launchpads = limited(LAUNCHPADS_SEED)
+        validate_response("launchpads", launchpads)
+        LOADERS["launchpads"](conn, launchpads)
+        logger.info("  loaded %d launchpads record(s)", len(launchpads))
+
+    with conn:
+        logger.info("Loading landpads (hand-seeded, no live/cached source exists -- see README) ...")
+        landpads = limited(LANDPADS_SEED)
+        validate_response("landpads", landpads)
+        LOADERS["landpads"](conn, landpads)
+        logger.info("  loaded %d landpads record(s)", len(landpads))
+
+    with conn:
+        logger.info("Fetching capsules (Wayback Machine snapshot) ...")
+        capsules, n = fetch_wayback("capsules")
+        total_raw_bytes += n
+        validate_response("capsules", capsules)
+        capsules = limited(capsules)
+        LOADERS["capsules"](conn, capsules)
+        logger.info("  loaded %d capsules record(s)", len(capsules))
+
+    with conn:
+        logger.info("Fetching launches (Wayback Machine snapshot) ...")
+        launches, n = fetch_wayback("launches")
+        total_raw_bytes += n
+        validate_response("launches", launches)
+        launches = limited(launches)
+
+        logger.info("Deriving cores stubs from launches (no live/cached cores source -- see README) ...")
+        cores = derive_core_stubs(launches)
+        validate_response("cores", cores)
+        LOADERS["cores"](conn, cores)
+        logger.info("  loaded %d cores record(s) (id only -- no metadata source available)", len(cores))
+
+        LOADERS["launches"](conn, launches)
+        logger.info("  loaded %d launches record(s)", len(launches))
+
+    with conn:
+        logger.info("Fetching payloads (Wayback Machine snapshot) ...")
+        payloads, n = fetch_wayback("payloads")
+        total_raw_bytes += n
+        validate_response("payloads", payloads)
+        payloads = limited(payloads)
+        LOADERS["payloads"](conn, payloads)
+        logger.info("  loaded %d payloads record(s)", len(payloads))
+
+    with conn:
+        logger.info("Fetching starlink (live Celestrak GP elements + SATCAT -- see README) ...")
+        try:
+            gp_rows, gp_bytes = fetch_celestrak_gp_starlink()
+            satcat_rows, satcat_bytes = fetch_celestrak_satcat_starlink()
+        except RuntimeError as exc:
+            raise RuntimeError(
+                f"{exc}\nNote: celestrak.org enforces a per-IP courtesy throttle on repeat "
+                "GP downloads of the same group within its ~2h refresh window (a 403 with a "
+                "'has not updated since your last successful download' body is that throttle, "
+                "not a real outage) -- wait for the window to pass, or retry from a different "
+                "network."
+            ) from exc
+        total_raw_bytes += gp_bytes + satcat_bytes
+        starlink = _celestrak_to_starlink_records(gp_rows, satcat_rows)
+        validate_response("starlink", starlink)
+        starlink = limited(starlink)
+        LOADERS["starlink"](conn, starlink)
+        logger.info("  loaded %d starlink record(s)", len(starlink))
+
+    logger.info(
+        "Total raw bytes downloaded: %.2f MB (Wayback Machine + Celestrak; excludes the "
+        "hand-seeded launchpads/landpads and derived cores stubs, which aren't network-fetched)",
+        total_raw_bytes / 1_000_000,
+    )
     conn.close()
 
 

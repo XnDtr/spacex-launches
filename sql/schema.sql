@@ -3,6 +3,12 @@
 -- Natural keys from the API (24-char hex ids) are used as primary keys so that
 -- re-ingestion can UPSERT idempotently instead of inserting duplicates.
 --
+-- Provenance note: the live API is dead (see README "Known data quality").
+-- rockets/launchpads/landpads/capsules/cores/launches/payloads keep the
+-- original API's id scheme (real ids, sourced via Wayback Machine snapshot
+-- or hand-seeded); `starlink` is now sourced from Celestrak instead, keyed
+-- on NORAD catalog id rather than the original API's string id.
+--
 -- Scope note: the `ships` and `crew` endpoints are deliberately NOT modeled.
 -- They're low-value for the analysis questions this project answers (crew
 -- data barely exists pre-Commercial-Crew, and ship recovery data duplicates
@@ -79,6 +85,9 @@ CREATE TABLE IF NOT EXISTS capsules (
     last_ingested_at    TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP)
 );
 
+-- No live/cached source for core metadata exists (see README) -- rows here
+-- are id-only stubs derived from launches, so every column but core_id is
+-- expected to be null.
 CREATE TABLE IF NOT EXISTS cores (
     core_id             TEXT PRIMARY KEY,
     serial              TEXT,
@@ -193,6 +202,10 @@ CREATE TABLE IF NOT EXISTS payload_nationalities (
 
 -- ---------------------------------------------------------------------------
 -- Starlink satellites (largest table by row count; drives raw-size requirement)
+-- Sourced live from Celestrak (GP elements + SATCAT), not the dead SpaceX
+-- API -- launch_id, longitude/latitude, and velocity_kms are unavailable
+-- from that source (no SpaceX-internal launch linkage, no SGP4 propagation
+-- for live position) and are expected to be null. See README.
 -- ---------------------------------------------------------------------------
 
 CREATE TABLE IF NOT EXISTS starlink (
