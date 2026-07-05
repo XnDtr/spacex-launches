@@ -10,12 +10,16 @@ venv/
 *.sqlite3
 data/raw/
 
+# generated charts — script produces these, not committed
+analysis/output/
+
 # exercise prompt, not part of the deliverable
 DATA-Technical Exercise-020726-194640.pdf
 
 .ipynb_checkpoints/
 .DS_Store
 .pytest_cache/
+.idea/
 
 # ingestion run log
 ingest.log
