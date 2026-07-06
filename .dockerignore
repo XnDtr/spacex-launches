@@ -1,0 +1,15 @@
+.venv/
+venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.git/
+.idea/
+*.db
+*.sqlite
+*.sqlite3
+ingest.log
+analysis/output/
+DATA-Technical Exercise-020726-194640.pdf

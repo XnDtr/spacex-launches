@@ -314,3 +314,17 @@ cause of a failed run. The SATCAT CSV has no such throttle.
   sufficient for this data volume.
 - `requests` for HTTP, `pandas`/`matplotlib` for the two Python-tooling
   questions — no heavier framework needed for a dataset this size.
+
+## Optional: Docker
+
+```bash
+docker build -t spacex-launches .
+docker run --rm -v "$(pwd)/data:/data" spacex-launches
+```
+
+Runs the ETL then the analysis inside the container; `spacex.db`, `ingest.log`,
+and the charts land in `./data` on the host (the container's `/data` is a
+volume so nothing generated lives inside the image, consistent with the repo
+itself not committing them). Not exercised in CI — Docker wasn't available
+in the environment this was built in, so treat it as reviewed-but-unverified
+rather than tested.

@@ -240,8 +240,14 @@ CREATE INDEX IF NOT EXISTS idx_launches_rocket        ON launches(rocket_id);
 CREATE INDEX IF NOT EXISTS idx_launches_launchpad      ON launches(launchpad_id);
 CREATE INDEX IF NOT EXISTS idx_launches_date_utc       ON launches(date_utc);
 CREATE INDEX IF NOT EXISTS idx_launches_success        ON launches(success);
+-- Q1/Q3 GROUP BY substr(date_utc,1,4), not the raw column -- a plain index on
+-- date_utc can't accelerate that (verified via EXPLAIN QUERY PLAN: without
+-- this, both queries fall back to a full table scan for the GROUP BY).
+CREATE INDEX IF NOT EXISTS idx_launches_year          ON launches(substr(date_utc, 1, 4));
 
 CREATE INDEX IF NOT EXISTS idx_launch_cores_core       ON launch_cores(core_id);
+-- Q2 GROUPs BY this column directly.
+CREATE INDEX IF NOT EXISTS idx_launch_cores_flight_num ON launch_cores(core_flight_num);
 CREATE INDEX IF NOT EXISTS idx_launch_cores_landpad    ON launch_cores(landpad_id);
 
 CREATE INDEX IF NOT EXISTS idx_payloads_launch         ON payloads(launch_id);
