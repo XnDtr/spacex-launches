@@ -21,9 +21,12 @@ def make_db():
 
 
 def load_all(conn, fixtures):
+    # LOADERS' insertion order is itself the required FK-safe load order
+    # (parents before the child rows that reference them) -- single source
+    # of truth, so this can't drift from what main() actually calls.
     with conn:
-        for name in ingest.ENDPOINTS:
-            ingest.LOADERS[name](conn, fixtures[name])
+        for name, loader in ingest.LOADERS.items():
+            loader(conn, fixtures[name])
 
 
 def counts(conn):
@@ -122,7 +125,103 @@ def test_payload_with_unknown_launch_id_gets_fk_nulled_not_fatal(caplog):
         (FIXTURES["payloads"][0]["id"],),
     ).fetchone()
     assert row == (None,)
-    assert any("absent from the launches snapshot" in m for m in caplog.messages)
+    assert any("absent from its table" in m for m in caplog.messages)
+
+
+def test_payload_fk_nulling_blames_limit_truncation_when_told_so(caplog):
+    """The same dangling-FK symptom has two different real causes: a genuine
+    cross-snapshot mismatch, or --limit truncating launches/payloads to
+    different subsets. load_payloads(..., truncated=True) must say so rather
+    than always blaming a "snapshot-time mismatch", which is misleading and
+    was the actual bug this test guards against."""
+    conn = make_db()
+    ingest.LOADERS["rockets"](conn, FIXTURES["rockets"])
+    ingest.LOADERS["launchpads"](conn, FIXTURES["launchpads"])
+    ingest.LOADERS["landpads"](conn, FIXTURES["landpads"])
+    ingest.LOADERS["capsules"](conn, FIXTURES["capsules"])
+    ingest.LOADERS["cores"](conn, FIXTURES["cores"])
+    ingest.load_launches(conn, FIXTURES["launches"])  # no matching payload's launch present
+
+    changed_payload = copy.deepcopy(FIXTURES["payloads"])
+    changed_payload[0]["launch"] = "a-launch-id-outside-this---limit-slice"
+
+    with caplog.at_level("WARNING", logger="spacex_ingest"):
+        ingest.load_payloads(conn, changed_payload, truncated=True)
+
+    assert any("likely --limit truncation" in m for m in caplog.messages)
+    assert not any("a cross-snapshot mismatch" in m for m in caplog.messages)
+
+
+def test_launch_with_unknown_rocket_and_launchpad_gets_fk_nulled_not_fatal(caplog):
+    """Same class of risk as the payload FK above applies to launches.rocket_id
+    and launches.launchpad_id (rockets/launchpads are separately-sourced from
+    launches) -- load_launches() must degrade gracefully here too instead of
+    only handling this for payloads."""
+    conn = make_db()
+    ingest.LOADERS["rockets"](conn, FIXTURES["rockets"])
+    ingest.LOADERS["launchpads"](conn, FIXTURES["launchpads"])
+    ingest.LOADERS["landpads"](conn, FIXTURES["landpads"])
+    ingest.LOADERS["capsules"](conn, FIXTURES["capsules"])  # so the fixture launch's capsule_id FK resolves
+    ingest.LOADERS["cores"](conn, FIXTURES["cores"])  # so the fixture launch's core_id FK resolves
+
+    changed_launch = copy.deepcopy(FIXTURES["launches"])
+    changed_launch[0]["rocket"] = "unknown-rocket-id"
+    changed_launch[0]["launchpad"] = "unknown-launchpad-id"
+
+    with caplog.at_level("WARNING", logger="spacex_ingest"):
+        ingest.load_launches(conn, changed_launch)  # must not raise
+
+    row = conn.execute(
+        "SELECT rocket_id, launchpad_id FROM launches WHERE launch_id = ?",
+        (FIXTURES["launches"][0]["id"],),
+    ).fetchone()
+    assert row == (None, None)
+    assert any("absent from its table" in m for m in caplog.messages)
+
+
+def test_launch_core_with_unknown_landpad_gets_fk_nulled_not_fatal(caplog):
+    """launch_cores.landpad_id comes from the hand-seeded LANDPADS_SEED, a
+    different source than launches -- same dangling-FK risk, same fix."""
+    conn = make_db()
+    ingest.LOADERS["rockets"](conn, FIXTURES["rockets"])
+    ingest.LOADERS["launchpads"](conn, FIXTURES["launchpads"])
+    ingest.LOADERS["landpads"](conn, FIXTURES["landpads"])
+    ingest.LOADERS["capsules"](conn, FIXTURES["capsules"])  # so the fixture launch's capsule_id FK resolves
+    ingest.LOADERS["cores"](conn, FIXTURES["cores"])  # so the fixture launch's core_id FK resolves
+
+    changed_launch = copy.deepcopy(FIXTURES["launches"])
+    changed_launch[0]["cores"][0]["landpad"] = "unknown-landpad-id"
+    changed_launch[0]["cores"][0]["landing_attempt"] = True
+
+    with caplog.at_level("WARNING", logger="spacex_ingest"):
+        ingest.load_launches(conn, changed_launch)  # must not raise
+
+    row = conn.execute(
+        "SELECT landpad_id FROM launch_cores WHERE launch_id = ?",
+        (FIXTURES["launches"][0]["id"],),
+    ).fetchone()
+    assert row == (None,)
+    assert any("absent from its table" in m for m in caplog.messages)
+
+
+def test_load_cores_accepts_production_shaped_id_only_stub_rows():
+    """The CORES fixture is a fully-populated record shaped like the old,
+    now-dead API -- but main() never actually calls load_cores with that
+    shape, only with id-only stubs from derive_core_stubs(). This exercises
+    the shape production actually uses, which the fixture-driven tests
+    above don't cover."""
+    conn = make_db()
+    stub_rows = ingest.derive_core_stubs([
+        {"cores": [{"core": "core-a"}, {"core": "core-b"}]},
+    ])
+    ingest.LOADERS["cores"](conn, stub_rows)  # must not raise
+
+    rows = conn.execute("SELECT core_id, serial, block FROM cores ORDER BY core_id").fetchall()
+    assert rows == [("core-a", None, None), ("core-b", None, None)]
+
+    # idempotent re-run over the same stub shape
+    ingest.LOADERS["cores"](conn, stub_rows)
+    assert conn.execute("SELECT COUNT(*) FROM cores").fetchone()[0] == 2
 
 
 def test_joins_resolve_across_foreign_keys():
@@ -218,4 +317,24 @@ def test_celestrak_adapter_ignores_non_starlink_rows_already_filtered_upstream()
     records = ingest._celestrak_to_starlink_records(gp_rows, [])
     assert len(records) == 1
     assert records[0]["spaceTrack"]["LAUNCH_DATE"] is None
-    assert records[0]["spaceTrack"]["COUNTRY_CODE"] == "US"  # falls back when SATCAT has no match
+    assert records[0]["spaceTrack"]["COUNTRY_CODE"] is None  # no SATCAT match -- null, not a guess
+
+
+def test_parse_satcat_csv_filters_to_starlink_rows():
+    csv_text = (
+        "OBJECT_NAME,OBJECT_ID,NORAD_CAT_ID,OWNER,LAUNCH_DATE,DECAY_DATE\n"
+        "STARLINK-1007,2019-074A,44713,US,2019-11-11,\n"
+        "ONEWEB-0012,2019-010A,44057,US,2019-02-27,\n"
+    )
+    rows = ingest._parse_satcat_csv(csv_text)
+    assert len(rows) == 1
+    assert rows[0]["OBJECT_NAME"] == "STARLINK-1007"
+
+
+def test_parse_satcat_csv_raises_on_unexpected_shape():
+    """A non-CSV 200 response (e.g. an HTML error page) must fail loudly
+    rather than silently parsing to zero rows -- that used to mask itself
+    as "SATCAT just has no Starlink satellites today" with no error at all."""
+    html_error_page = "<html><body>Service temporarily unavailable</body></html>"
+    with pytest.raises(RuntimeError, match="expected columns"):
+        ingest._parse_satcat_csv(html_error_page)

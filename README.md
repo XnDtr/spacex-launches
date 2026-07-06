@@ -282,6 +282,22 @@ cause of a failed run. The SATCAT CSV has no such throttle.
 
 ## Known limitations
 
+- **Cross-snapshot foreign keys get nulled, not crashed, when they don't
+  resolve.** rockets/launchpads/landpads/capsules/launches/payloads come from
+  independently-dated sources (see table above), so a launch's `rocket_id`/
+  `launchpad_id`, a core's `landpad_id`, or a payload's `launch_id` can
+  reference a parent row absent from its (differently-dated) table. Rather
+  than let `PRAGMA foreign_keys = ON` abort the whole insert, these get
+  nulled with a logged warning. Running with `--limit N` produces the exact
+  same symptom for an unrelated reason (truncation, not a real mismatch) --
+  the warning message says which one it is.
+- **A run that fails partway leaves some tables fresher than others.** Each
+  table commits independently (a deliberate tradeoff so e.g. Celestrak's
+  throttle doesn't force re-fetching Wayback snapshots that already
+  succeeded) -- the single-row `ingest_runs` table only gets written after
+  every table succeeds, so comparing it against each table's
+  `last_ingested_at` reveals whether the database reflects one full run or
+  a mix of runs.
 - **`cores` has no metadata beyond its id** (see table above) — `serial`,
   `block`, and reuse/landing counts are null for every row. Q2's analysis
   (landing success by reuse count) uses `launch_cores.core_flight_num`, which

@@ -18,6 +18,16 @@
 
 PRAGMA foreign_keys = ON;
 
+-- Each top-level table commits independently (see ingest.py main()), so a run
+-- that fails partway leaves some tables fresh and others stale from a prior
+-- run -- indistinguishable from a fully consistent snapshot by row counts
+-- alone. This single-row table is only written after every table succeeds,
+-- so comparing it against each table's last_ingested_at reveals a partial run.
+CREATE TABLE IF NOT EXISTS ingest_runs (
+    id              INTEGER PRIMARY KEY CHECK (id = 1),
+    completed_at    TEXT NOT NULL
+);
+
 -- ---------------------------------------------------------------------------
 -- Reference / dimension tables
 -- ---------------------------------------------------------------------------

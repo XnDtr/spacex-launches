@@ -74,17 +74,6 @@ BASE_URL = "https://api.spacexdata.com/v4"
 SCRIPT_DIR = pathlib.Path(__file__).resolve().parent
 SCHEMA_PATH = SCRIPT_DIR.parent / "sql" / "schema.sql"
 
-ENDPOINTS: list[str] = [
-    "rockets",
-    "launchpads",
-    "landpads",
-    "capsules",
-    "cores",
-    "launches",
-    "payloads",
-    "starlink",
-]
-
 # Wayback Machine snapshot timestamps of the real (now-dead) API responses --
 # see module docstring. Format matches web.archive.org's /web/<timestamp>/ path.
 WAYBACK_SNAPSHOTS: dict[str, str] = {
@@ -261,14 +250,32 @@ def fetch_celestrak_gp_starlink() -> tuple[list[JsonRecord], int]:
     return data, len(resp.content)
 
 
+SATCAT_EXPECTED_COLUMNS = {"OBJECT_NAME", "OBJECT_ID", "LAUNCH_DATE", "DECAY_DATE", "OWNER"}
+
+
+def _parse_satcat_csv(text: str) -> list[dict[str, str]]:
+    """Parse SATCAT CSV text down to Starlink rows.
+
+    Unlike the GP feed (JSON, checked for list-shape in
+    `fetch_celestrak_gp_starlink`), a non-CSV response here (e.g. an HTML
+    error page served with a 200) wouldn't raise -- DictReader would just
+    silently yield zero matching rows, masking the real cause. Fail loudly
+    on a missing/wrong header instead.
+    """
+    reader = csv.DictReader(io.StringIO(text))
+    fieldnames = set(reader.fieldnames or [])
+    if not SATCAT_EXPECTED_COLUMNS.issubset(fieldnames):
+        raise RuntimeError(
+            f"Celestrak SATCAT: expected columns {sorted(SATCAT_EXPECTED_COLUMNS)}, got "
+            f"{sorted(fieldnames)}. The response may be an error page rather than real CSV."
+        )
+    return [row for row in reader if row.get("OBJECT_NAME", "").upper().startswith("STARLINK")]
+
+
 def fetch_celestrak_satcat_starlink() -> tuple[list[dict[str, str]], int]:
     """Live satellite catalog rows (launch/decay history) for Starlink, active + decayed."""
     resp = _get_with_retries(CELESTRAK_SATCAT_URL, timeout=120)
-    rows = [
-        row for row in csv.DictReader(io.StringIO(resp.text))
-        if row.get("OBJECT_NAME", "").upper().startswith("STARLINK")
-    ]
-    return rows, len(resp.content)
+    return _parse_satcat_csv(resp.text), len(resp.content)
 
 
 def derive_core_stubs(launches_data: list[JsonRecord]) -> list[JsonRecord]:
@@ -313,54 +320,71 @@ def _celestrak_to_starlink_records(
     gp_by_object_id = {row["OBJECT_ID"]: row for row in gp_rows if row.get("OBJECT_ID")}
 
     records: list[JsonRecord] = []
+    skipped = 0
     for object_id, gp in gp_by_object_id.items():
-        sat = satcat_by_object_id.get(object_id, {})
-        mean_motion = gp.get("MEAN_MOTION")
-        semimajor = _semimajor_axis_km(mean_motion)
-        records.append({
-            "id": str(gp.get("NORAD_CAT_ID") or object_id),
-            "version": None, "launch": None, "longitude": None, "latitude": None,
-            "height_km": (semimajor - EARTH_MEAN_RADIUS_KM) if semimajor is not None else None,
-            "velocity_kms": None,
-            "spaceTrack": {
-                "OBJECT_NAME": gp.get("OBJECT_NAME"), "OBJECT_ID": object_id,
-                "NORAD_CAT_ID": gp.get("NORAD_CAT_ID"),
-                "LAUNCH_DATE": sat.get("LAUNCH_DATE") or None,
-                "COUNTRY_CODE": sat.get("OWNER") or "US",
-                "EPOCH": gp.get("EPOCH"), "MEAN_MOTION": mean_motion,
-                "ECCENTRICITY": gp.get("ECCENTRICITY"), "INCLINATION": gp.get("INCLINATION"),
-                "PERIOD": (1440.0 / mean_motion) if mean_motion else None,
-                "SEMIMAJOR_AXIS": semimajor,
-                "DECAY_DATE": sat.get("DECAY_DATE") or None,
-            },
-        })
+        try:
+            sat = satcat_by_object_id.get(object_id, {})
+            mean_motion = gp.get("MEAN_MOTION")
+            semimajor = _semimajor_axis_km(mean_motion)
+            records.append({
+                "id": str(gp.get("NORAD_CAT_ID") or object_id),
+                "version": None, "launch": None, "longitude": None, "latitude": None,
+                "height_km": (semimajor - EARTH_MEAN_RADIUS_KM) if semimajor is not None else None,
+                "velocity_kms": None,
+                "spaceTrack": {
+                    "OBJECT_NAME": gp.get("OBJECT_NAME"), "OBJECT_ID": object_id,
+                    "NORAD_CAT_ID": gp.get("NORAD_CAT_ID"),
+                    "LAUNCH_DATE": sat.get("LAUNCH_DATE") or None,
+                    "COUNTRY_CODE": sat.get("OWNER") or None,
+                    "EPOCH": gp.get("EPOCH"), "MEAN_MOTION": mean_motion,
+                    "ECCENTRICITY": gp.get("ECCENTRICITY"), "INCLINATION": gp.get("INCLINATION"),
+                    "PERIOD": (1440.0 / mean_motion) if mean_motion else None,
+                    "SEMIMAJOR_AXIS": semimajor,
+                    "DECAY_DATE": sat.get("DECAY_DATE") or None,
+                },
+            })
+        except Exception:
+            skipped += 1
+            logger.warning(
+                "starlink: skipping malformed Celestrak GP record object_id=%s", object_id, exc_info=True
+            )
 
     # Decayed/no-longer-tracked satellites have no current GP element, but
     # SATCAT still has their launch/decay history and last-known orbit --
     # keep them (with coarser, non-propagated orbital fields) rather than
     # silently dropping all decay history.
-    seen = set(gp_by_object_id)
     for object_id, sat in satcat_by_object_id.items():
-        if object_id in seen:
+        if object_id in gp_by_object_id:
             continue
-        apogee, perigee = _to_float(sat.get("APOGEE")), _to_float(sat.get("PERIGEE"))
-        records.append({
-            "id": str(sat.get("NORAD_CAT_ID") or object_id),
-            "version": None, "launch": None, "longitude": None, "latitude": None,
-            "height_km": (apogee + perigee) / 2 if apogee is not None and perigee is not None else None,
-            "velocity_kms": None,
-            "spaceTrack": {
-                "OBJECT_NAME": sat.get("OBJECT_NAME"), "OBJECT_ID": object_id,
-                "NORAD_CAT_ID": sat.get("NORAD_CAT_ID"),
-                "LAUNCH_DATE": sat.get("LAUNCH_DATE") or None,
-                "COUNTRY_CODE": sat.get("OWNER") or "US",
-                "EPOCH": None, "MEAN_MOTION": None, "ECCENTRICITY": None,
-                "INCLINATION": _to_float(sat.get("INCLINATION")),
-                "PERIOD": _to_float(sat.get("PERIOD")),
-                "SEMIMAJOR_AXIS": None,
-                "DECAY_DATE": sat.get("DECAY_DATE") or None,
-            },
-        })
+        try:
+            apogee, perigee = _to_float(sat.get("APOGEE")), _to_float(sat.get("PERIGEE"))
+            records.append({
+                "id": str(sat.get("NORAD_CAT_ID") or object_id),
+                "version": None, "launch": None, "longitude": None, "latitude": None,
+                "height_km": (
+                    (apogee + perigee) / 2 if apogee is not None and perigee is not None else None
+                ),
+                "velocity_kms": None,
+                "spaceTrack": {
+                    "OBJECT_NAME": sat.get("OBJECT_NAME"), "OBJECT_ID": object_id,
+                    "NORAD_CAT_ID": sat.get("NORAD_CAT_ID"),
+                    "LAUNCH_DATE": sat.get("LAUNCH_DATE") or None,
+                    "COUNTRY_CODE": sat.get("OWNER") or None,
+                    "EPOCH": None, "MEAN_MOTION": None, "ECCENTRICITY": None,
+                    "INCLINATION": _to_float(sat.get("INCLINATION")),
+                    "PERIOD": _to_float(sat.get("PERIOD")),
+                    "SEMIMAJOR_AXIS": None,
+                    "DECAY_DATE": sat.get("DECAY_DATE") or None,
+                },
+            })
+        except Exception:
+            skipped += 1
+            logger.warning(
+                "starlink: skipping malformed SATCAT record object_id=%s", object_id, exc_info=True
+            )
+
+    if skipped:
+        logger.warning("starlink: skipped %d malformed Celestrak record(s)", skipped)
     return records
 
 
@@ -405,6 +429,31 @@ def safe_map(rows: list[JsonRecord], mapper: RowMapper, endpoint: str) -> list[R
     if skipped:
         logger.warning("%s: skipped %d malformed record(s) out of %d", endpoint, skipped, len(rows))
     return mapped
+
+
+def _null_dangling_fk(
+    rows: list[Row], fk_column: str, known_ids: set[Any], id_column: str, endpoint: str, truncated: bool
+) -> None:
+    """Null out fk_column on any row whose value isn't in known_ids, rather than
+    letting the FK constraint abort the whole insert.
+
+    This is a real, not just theoretical, risk: rockets/capsules/launches/payloads
+    are independently-dated Wayback snapshots (see README "Known data quality"),
+    so a child row can reference a parent id that exists in its own snapshot but
+    not in a differently-dated one. `truncated` distinguishes that genuine
+    cross-snapshot mismatch from expected `--limit` truncation (which produces
+    the exact same symptom -- a missing parent id -- for an unrelated reason),
+    so the log message doesn't misdiagnose the cause.
+    """
+    reason = "likely --limit truncation, not a data issue" if truncated else "a cross-snapshot mismatch"
+    for row in rows:
+        value = row.get(fk_column)
+        if value is not None and value not in known_ids:
+            logger.warning(
+                "%s: %s=%s references %s=%s, absent from its table (%s) -- nulling the FK",
+                endpoint, id_column, row.get(id_column), fk_column, value, reason,
+            )
+            row[fk_column] = None
 
 
 def init_schema(conn: sqlite3.Connection) -> None:
@@ -583,7 +632,16 @@ def _core_row(r: JsonRecord) -> Row:
     }
 
 
-def load_launches(conn: sqlite3.Connection, rows: list[JsonRecord]) -> None:
+def load_launches(conn: sqlite3.Connection, rows: list[JsonRecord], truncated: bool = False) -> None:
+    # rockets/launchpads/launches can be independently-dated sources (see
+    # README "Known data quality") -- null a dangling rocket_id/launchpad_id
+    # rather than let the FK constraint abort the whole insert.
+    known_rocket_ids = {r[0] for r in conn.execute("SELECT rocket_id FROM rockets")}
+    known_launchpad_ids = {r[0] for r in conn.execute("SELECT launchpad_id FROM launchpads")}
+    mapped = safe_map(rows, _launch_row, "launches")
+    _null_dangling_fk(mapped, "rocket_id", known_rocket_ids, "launch_id", "launches", truncated)
+    _null_dangling_fk(mapped, "launchpad_id", known_launchpad_ids, "launch_id", "launches", truncated)
+
     conn.executemany(
         """
         INSERT INTO launches (
@@ -617,7 +675,7 @@ def load_launches(conn: sqlite3.Connection, rows: list[JsonRecord]) -> None:
             webcast_url=excluded.webcast_url, article_url=excluded.article_url,
             wikipedia_url=excluded.wikipedia_url, last_ingested_at=CURRENT_TIMESTAMP
         """,
-        safe_map(rows, _launch_row, "launches"),
+        mapped,
     )
 
     # child collections: delete-then-reinsert per launch for idempotency
@@ -667,6 +725,11 @@ def load_launches(conn: sqlite3.Connection, rows: list[JsonRecord]) -> None:
             failure_rows,
         )
     if core_rows:
+        # landpad_id comes from the hand-seeded LANDPADS_SEED (a different
+        # source than the launches snapshot) -- null a dangling reference
+        # rather than let the FK constraint abort the whole insert.
+        known_landpad_ids = {r[0] for r in conn.execute("SELECT landpad_id FROM landpads")}
+        _null_dangling_fk(core_rows, "landpad_id", known_landpad_ids, "launch_id", "launch_cores", truncated)
         conn.executemany(
             """
             INSERT OR IGNORE INTO launch_cores (
@@ -716,7 +779,7 @@ def _launch_row(r: JsonRecord) -> Row:
     }
 
 
-def load_payloads(conn: sqlite3.Connection, rows: list[JsonRecord]) -> None:
+def load_payloads(conn: sqlite3.Connection, rows: list[JsonRecord], truncated: bool = False) -> None:
     # rockets/capsules/launches/payloads are independently-dated Wayback
     # snapshots (see README), so a payload can reference a launch_id that
     # existed when the payloads snapshot was taken but is absent from the
@@ -725,14 +788,7 @@ def load_payloads(conn: sqlite3.Connection, rows: list[JsonRecord]) -> None:
     # fail the whole load.
     known_launch_ids = {row[0] for row in conn.execute("SELECT launch_id FROM launches")}
     mapped = safe_map(rows, _payload_row, "payloads")
-    for row in mapped:
-        if row["launch_id"] is not None and row["launch_id"] not in known_launch_ids:
-            logger.warning(
-                "payloads: payload_id=%s references launch_id=%s, absent from the "
-                "launches snapshot (snapshot-time mismatch) -- nulling the FK",
-                row["payload_id"], row["launch_id"],
-            )
-            row["launch_id"] = None
+    _null_dangling_fk(mapped, "launch_id", known_launch_ids, "payload_id", "payloads", truncated)
 
     conn.executemany(
         """
@@ -886,6 +942,11 @@ def main() -> None:
     def limited(rows: list[JsonRecord]) -> list[JsonRecord]:
         return rows if args.limit is None else rows[: args.limit]
 
+    # Distinguishes a genuine cross-snapshot FK mismatch from expected --limit
+    # truncation in _null_dangling_fk()'s log messages (they produce the same
+    # symptom -- a missing parent id -- for very different reasons).
+    truncated = args.limit is not None
+
     # Each table commits independently (rather than one all-or-nothing
     # transaction for the whole run) -- sources are now heterogeneous
     # (Wayback/hand-seeded/derived/live Celestrak), so a transient failure
@@ -904,15 +965,15 @@ def main() -> None:
 
     with conn:
         logger.info("Loading launchpads (hand-seeded, no live/cached source exists -- see README) ...")
+        validate_response("launchpads", LAUNCHPADS_SEED)
         launchpads = limited(LAUNCHPADS_SEED)
-        validate_response("launchpads", launchpads)
         LOADERS["launchpads"](conn, launchpads)
         logger.info("  loaded %d launchpads record(s)", len(launchpads))
 
     with conn:
         logger.info("Loading landpads (hand-seeded, no live/cached source exists -- see README) ...")
+        validate_response("landpads", LANDPADS_SEED)
         landpads = limited(LANDPADS_SEED)
-        validate_response("landpads", landpads)
         LOADERS["landpads"](conn, landpads)
         logger.info("  loaded %d landpads record(s)", len(landpads))
 
@@ -938,7 +999,7 @@ def main() -> None:
         LOADERS["cores"](conn, cores)
         logger.info("  loaded %d cores record(s) (id only -- no metadata source available)", len(cores))
 
-        LOADERS["launches"](conn, launches)
+        load_launches(conn, launches, truncated=truncated)
         logger.info("  loaded %d launches record(s)", len(launches))
 
     with conn:
@@ -947,7 +1008,7 @@ def main() -> None:
         total_raw_bytes += n
         validate_response("payloads", payloads)
         payloads = limited(payloads)
-        LOADERS["payloads"](conn, payloads)
+        load_payloads(conn, payloads, truncated=truncated)
         logger.info("  loaded %d payloads record(s)", len(payloads))
 
     with conn:
@@ -969,6 +1030,14 @@ def main() -> None:
         starlink = limited(starlink)
         LOADERS["starlink"](conn, starlink)
         logger.info("  loaded %d starlink record(s)", len(starlink))
+
+    # Only reached if every table above committed -- see the ingest_runs
+    # comment in schema.sql for why this matters.
+    with conn:
+        conn.execute(
+            "INSERT INTO ingest_runs (id, completed_at) VALUES (1, CURRENT_TIMESTAMP) "
+            "ON CONFLICT(id) DO UPDATE SET completed_at = excluded.completed_at"
+        )
 
     logger.info(
         "Total raw bytes downloaded: %.2f MB (Wayback Machine + Celestrak; excludes the "
