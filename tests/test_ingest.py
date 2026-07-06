@@ -29,6 +29,15 @@ def load_all(conn, fixtures):
             loader(conn, fixtures[name])
 
 
+def load_parent_tables(conn, fixtures=FIXTURES):
+    """Load every table load_launches()/load_payloads() reference via FK
+    (rockets, launchpads, landpads, capsules, cores) without loading
+    launches/payloads/starlink themselves -- shared setup for tests that
+    call load_launches()/load_payloads() directly to control their input."""
+    for name in ("rockets", "launchpads", "landpads", "capsules", "cores"):
+        ingest.LOADERS[name](conn, fixtures[name])
+
+
 def counts(conn):
     tables = [
         "rockets", "launchpads", "landpads", "capsules", "cores", "launches",
@@ -135,11 +144,7 @@ def test_payload_fk_nulling_blames_limit_truncation_when_told_so(caplog):
     than always blaming a "snapshot-time mismatch", which is misleading and
     was the actual bug this test guards against."""
     conn = make_db()
-    ingest.LOADERS["rockets"](conn, FIXTURES["rockets"])
-    ingest.LOADERS["launchpads"](conn, FIXTURES["launchpads"])
-    ingest.LOADERS["landpads"](conn, FIXTURES["landpads"])
-    ingest.LOADERS["capsules"](conn, FIXTURES["capsules"])
-    ingest.LOADERS["cores"](conn, FIXTURES["cores"])
+    load_parent_tables(conn)
     ingest.load_launches(conn, FIXTURES["launches"])  # no matching payload's launch present
 
     changed_payload = copy.deepcopy(FIXTURES["payloads"])
@@ -158,11 +163,7 @@ def test_launch_with_unknown_rocket_and_launchpad_gets_fk_nulled_not_fatal(caplo
     launches) -- load_launches() must degrade gracefully here too instead of
     only handling this for payloads."""
     conn = make_db()
-    ingest.LOADERS["rockets"](conn, FIXTURES["rockets"])
-    ingest.LOADERS["launchpads"](conn, FIXTURES["launchpads"])
-    ingest.LOADERS["landpads"](conn, FIXTURES["landpads"])
-    ingest.LOADERS["capsules"](conn, FIXTURES["capsules"])  # so the fixture launch's capsule_id FK resolves
-    ingest.LOADERS["cores"](conn, FIXTURES["cores"])  # so the fixture launch's core_id FK resolves
+    load_parent_tables(conn)
 
     changed_launch = copy.deepcopy(FIXTURES["launches"])
     changed_launch[0]["rocket"] = "unknown-rocket-id"
@@ -183,11 +184,7 @@ def test_launch_core_with_unknown_landpad_gets_fk_nulled_not_fatal(caplog):
     """launch_cores.landpad_id comes from the hand-seeded LANDPADS_SEED, a
     different source than launches -- same dangling-FK risk, same fix."""
     conn = make_db()
-    ingest.LOADERS["rockets"](conn, FIXTURES["rockets"])
-    ingest.LOADERS["launchpads"](conn, FIXTURES["launchpads"])
-    ingest.LOADERS["landpads"](conn, FIXTURES["landpads"])
-    ingest.LOADERS["capsules"](conn, FIXTURES["capsules"])  # so the fixture launch's capsule_id FK resolves
-    ingest.LOADERS["cores"](conn, FIXTURES["cores"])  # so the fixture launch's core_id FK resolves
+    load_parent_tables(conn)
 
     changed_launch = copy.deepcopy(FIXTURES["launches"])
     changed_launch[0]["cores"][0]["landpad"] = "unknown-landpad-id"
@@ -202,6 +199,28 @@ def test_launch_core_with_unknown_landpad_gets_fk_nulled_not_fatal(caplog):
     ).fetchone()
     assert row == (None,)
     assert any("absent from its table" in m for m in caplog.messages)
+
+
+def test_launch_capsule_with_unknown_capsule_id_drops_junction_row_not_fatal(caplog):
+    """launch_capsules.capsule_id is NOT NULL (part of the composite PK), so
+    an unresolvable reference must drop the junction row entirely rather than
+    null a mandatory column -- same dangling-FK risk as the others above, but
+    a different fix shape since nulling isn't an option here."""
+    conn = make_db()
+    load_parent_tables(conn)
+
+    changed_launch = copy.deepcopy(FIXTURES["launches"])
+    changed_launch[0]["capsules"] = ["unknown-capsule-id"]
+
+    with caplog.at_level("WARNING", logger="spacex_ingest"):
+        ingest.load_launches(conn, changed_launch)  # must not raise
+
+    row = conn.execute(
+        "SELECT COUNT(*) FROM launch_capsules WHERE launch_id = ?",
+        (FIXTURES["launches"][0]["id"],),
+    ).fetchone()
+    assert row == (0,)
+    assert any("dropping the junction row" in m for m in caplog.messages)
 
 
 def test_load_cores_accepts_production_shaped_id_only_stub_rows():

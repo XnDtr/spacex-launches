@@ -384,7 +384,9 @@ def _celestrak_to_starlink_records(
             )
 
     if skipped:
-        logger.warning("starlink: skipped %d malformed Celestrak record(s)", skipped)
+        logger.warning(
+            "starlink: skipped %d malformed record(s) out of %d", skipped, len(records) + skipped
+        )
     return records
 
 
@@ -431,21 +433,41 @@ def safe_map(rows: list[JsonRecord], mapper: RowMapper, endpoint: str) -> list[R
     return mapped
 
 
-def _null_dangling_fk(
-    rows: list[Row], fk_column: str, known_ids: set[Any], id_column: str, endpoint: str, truncated: bool
-) -> None:
-    """Null out fk_column on any row whose value isn't in known_ids, rather than
-    letting the FK constraint abort the whole insert.
-
-    This is a real, not just theoretical, risk: rockets/capsules/launches/payloads
-    are independently-dated Wayback snapshots (see README "Known data quality"),
-    so a child row can reference a parent id that exists in its own snapshot but
-    not in a differently-dated one. `truncated` distinguishes that genuine
-    cross-snapshot mismatch from expected `--limit` truncation (which produces
-    the exact same symptom -- a missing parent id -- for an unrelated reason),
-    so the log message doesn't misdiagnose the cause.
+def _fk_mismatch_reason(truncated: bool) -> str:
+    """rockets/capsules/launches/payloads are independently-dated Wayback
+    snapshots (see README "Known data quality"), so a child row can
+    reference a parent id that exists in its own snapshot but not in a
+    differently-dated one. `truncated` distinguishes that genuine
+    cross-snapshot mismatch from expected `--limit` truncation (which
+    produces the exact same symptom -- a missing parent id -- for an
+    unrelated reason), so callers' log messages don't misdiagnose the cause.
     """
-    reason = "likely --limit truncation, not a data issue" if truncated else "a cross-snapshot mismatch"
+    return "likely --limit truncation, not a data issue" if truncated else "a cross-snapshot mismatch"
+
+
+def _known_ids(conn: sqlite3.Connection, table: str, id_column: str) -> set[Any]:
+    """table/id_column are always internal literals (never derived from
+    fetched data), so building the query with an f-string here is safe."""
+    return {r[0] for r in conn.execute(f"SELECT {id_column} FROM {table}")}
+
+
+def _null_dangling_fk(
+    conn: sqlite3.Connection,
+    rows: list[Row],
+    fk_column: str,
+    parent_table: str,
+    parent_id_column: str,
+    *,
+    id_column: str,
+    endpoint: str,
+    truncated: bool,
+) -> None:
+    """Null out fk_column on any row whose value isn't currently in
+    parent_table, rather than letting the FK constraint abort the whole
+    insert. See `_fk_mismatch_reason` for what `truncated` is for.
+    """
+    known_ids = _known_ids(conn, parent_table, parent_id_column)
+    reason = _fk_mismatch_reason(truncated)
     for row in rows:
         value = row.get(fk_column)
         if value is not None and value not in known_ids:
@@ -636,11 +658,15 @@ def load_launches(conn: sqlite3.Connection, rows: list[JsonRecord], truncated: b
     # rockets/launchpads/launches can be independently-dated sources (see
     # README "Known data quality") -- null a dangling rocket_id/launchpad_id
     # rather than let the FK constraint abort the whole insert.
-    known_rocket_ids = {r[0] for r in conn.execute("SELECT rocket_id FROM rockets")}
-    known_launchpad_ids = {r[0] for r in conn.execute("SELECT launchpad_id FROM launchpads")}
     mapped = safe_map(rows, _launch_row, "launches")
-    _null_dangling_fk(mapped, "rocket_id", known_rocket_ids, "launch_id", "launches", truncated)
-    _null_dangling_fk(mapped, "launchpad_id", known_launchpad_ids, "launch_id", "launches", truncated)
+    _null_dangling_fk(
+        conn, mapped, "rocket_id", "rockets", "rocket_id",
+        id_column="launch_id", endpoint="launches", truncated=truncated,
+    )
+    _null_dangling_fk(
+        conn, mapped, "launchpad_id", "launchpads", "launchpad_id",
+        id_column="launch_id", endpoint="launches", truncated=truncated,
+    )
 
     conn.executemany(
         """
@@ -728,8 +754,10 @@ def load_launches(conn: sqlite3.Connection, rows: list[JsonRecord], truncated: b
         # landpad_id comes from the hand-seeded LANDPADS_SEED (a different
         # source than the launches snapshot) -- null a dangling reference
         # rather than let the FK constraint abort the whole insert.
-        known_landpad_ids = {r[0] for r in conn.execute("SELECT landpad_id FROM landpads")}
-        _null_dangling_fk(core_rows, "landpad_id", known_landpad_ids, "launch_id", "launch_cores", truncated)
+        _null_dangling_fk(
+            conn, core_rows, "landpad_id", "landpads", "landpad_id",
+            id_column="launch_id", endpoint="launch_cores", truncated=truncated,
+        )
         conn.executemany(
             """
             INSERT OR IGNORE INTO launch_cores (
@@ -743,9 +771,26 @@ def load_launches(conn: sqlite3.Connection, rows: list[JsonRecord], truncated: b
             core_rows,
         )
     if capsule_rows:
+        # capsule_id has the same cross-snapshot risk as rocket_id/launchpad_id/
+        # landpad_id above (capsules is an independently-dated Wayback snapshot)
+        # -- but unlike those, capsule_id is NOT NULL here (part of the
+        # composite PK), so an unresolvable reference means dropping the
+        # junction row entirely rather than nulling a mandatory column.
+        known_capsule_ids = _known_ids(conn, "capsules", "capsule_id")
+        reason = _fk_mismatch_reason(truncated)
+        resolvable_capsule_rows = []
+        for row in capsule_rows:
+            if row["capsule_id"] in known_capsule_ids:
+                resolvable_capsule_rows.append(row)
+            else:
+                logger.warning(
+                    "launch_capsules: launch_id=%s references capsule_id=%s, absent from "
+                    "its table (%s) -- dropping the junction row",
+                    row["launch_id"], row["capsule_id"], reason,
+                )
         conn.executemany(
             "INSERT OR IGNORE INTO launch_capsules (launch_id, capsule_id) VALUES (:launch_id, :capsule_id)",
-            capsule_rows,
+            resolvable_capsule_rows,
         )
 
 
@@ -786,9 +831,11 @@ def load_payloads(conn: sqlite3.Connection, rows: list[JsonRecord], truncated: b
     # (differently-dated) launches snapshot -- e.g. a placeholder combined
     # launch record later split/removed upstream. Null the FK rather than
     # fail the whole load.
-    known_launch_ids = {row[0] for row in conn.execute("SELECT launch_id FROM launches")}
     mapped = safe_map(rows, _payload_row, "payloads")
-    _null_dangling_fk(mapped, "launch_id", known_launch_ids, "payload_id", "payloads", truncated)
+    _null_dangling_fk(
+        conn, mapped, "launch_id", "launches", "launch_id",
+        id_column="payload_id", endpoint="payloads", truncated=truncated,
+    )
 
     conn.executemany(
         """
