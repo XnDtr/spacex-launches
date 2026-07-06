@@ -105,6 +105,26 @@ def test_malformed_record_is_skipped_not_fatal():
     assert c["rockets"] == 1  # only the well-formed rocket made it in
 
 
+def test_payload_with_unknown_launch_id_gets_fk_nulled_not_fatal(caplog):
+    """A payload can reference a launch_id absent from the launches table --
+    this happens for real with independently-dated Wayback snapshots (see
+    README "Known data quality"). load_payloads() should null the FK and
+    warn, not raise or leave a dangling reference."""
+    conn = make_db()
+    changed = copy.deepcopy(FIXTURES)
+    changed["payloads"][0]["launch"] = "some-launch-id-not-in-the-launches-table"
+
+    with caplog.at_level("WARNING", logger="spacex_ingest"):
+        load_all(conn, changed)  # must not raise despite the dangling reference
+
+    row = conn.execute(
+        "SELECT launch_id FROM payloads WHERE payload_id = ?",
+        (FIXTURES["payloads"][0]["id"],),
+    ).fetchone()
+    assert row == (None,)
+    assert any("absent from the launches snapshot" in m for m in caplog.messages)
+
+
 def test_joins_resolve_across_foreign_keys():
     conn = make_db()
     load_all(conn, FIXTURES)
