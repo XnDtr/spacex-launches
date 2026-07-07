@@ -76,8 +76,14 @@ STARLINK = [{
     },
 }]
 
+PRICING_BANDS = [{
+    "band_name": "Mid-latitude (40-60 deg)", "min_inclination_deg": 40.0, "max_inclination_deg": 60.0,
+    "monthly_price_usd": 95.0, "sat_throughput_gbps": 60.0, "notes": "test fixture",
+}]
+
 FIXTURES = {
     "rockets": ROCKETS, "launchpads": LAUNCHPADS, "landpads": LANDPADS,
     "capsules": CAPSULES, "cores": CORES, "launches": LAUNCHES,
     "payloads": PAYLOADS, "starlink": STARLINK,
+    "starlink_pricing_bands": PRICING_BANDS,
 }

@@ -43,6 +43,7 @@ def counts(conn):
         "rockets", "launchpads", "landpads", "capsules", "cores", "launches",
         "launch_failures", "launch_cores", "launch_capsules", "payloads",
         "payload_customers", "payload_nationalities", "starlink",
+        "starlink_pricing_bands",
     ]
     return {t: conn.execute(f"SELECT COUNT(*) FROM {t}").fetchone()[0] for t in tables}
 
@@ -58,6 +59,7 @@ def test_initial_load_populates_every_table():
     assert c["launch_capsules"] == 1
     assert c["payload_customers"] == 2
     assert c["payload_nationalities"] == 1
+    assert c["starlink_pricing_bands"] == 1
     assert c["starlink"] == 1
 
 

@@ -243,6 +243,29 @@ CREATE TABLE IF NOT EXISTS starlink (
 );
 
 -- ---------------------------------------------------------------------------
+-- Starlink unit-economics reference data (Q6) -- hand-curated, not fetched.
+-- Bands are defined by orbital inclination, which bounds the max latitude a
+-- satellite's ground track reaches, because that's directly computable from
+-- starlink.inclination_deg already above -- not by country/continent, which
+-- would need a ground-coverage model this project doesn't have. Real prices
+-- vary by country, not latitude, so each band's monthly_price_usd is a
+-- blended figure across that band's representative markets; throughput is
+-- per publicly reported figures for the satellite generation that mostly
+-- flies at that inclination. Full sourcing/citations: see README "Starlink
+-- unit economics". This is a back-of-envelope model, not verified financials.
+-- ---------------------------------------------------------------------------
+
+CREATE TABLE IF NOT EXISTS starlink_pricing_bands (
+    band_name              TEXT PRIMARY KEY,
+    min_inclination_deg    REAL NOT NULL,
+    max_inclination_deg    REAL NOT NULL,
+    monthly_price_usd      REAL NOT NULL,
+    sat_throughput_gbps    REAL NOT NULL,
+    notes                  TEXT,
+    last_ingested_at       TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP)
+);
+
+-- ---------------------------------------------------------------------------
 -- Indexes for analytical queries
 -- ---------------------------------------------------------------------------
 

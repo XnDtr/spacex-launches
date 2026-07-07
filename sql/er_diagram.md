@@ -86,8 +86,21 @@ erDiagram
         text launch_id FK
         real height_km
         real velocity_kms
+        real inclination_deg
         int decayed
     }
+    starlink_pricing_bands {
+        text band_name PK
+        real min_inclination_deg
+        real max_inclination_deg
+        real monthly_price_usd
+        real sat_throughput_gbps
+    }
 ```
+
+`starlink_pricing_bands` has no drawn relationship above because it's joined
+to `starlink` by a range condition (`inclination_deg BETWEEN
+min_inclination_deg AND max_inclination_deg`), not an equality FK — see Q6 in
+`analysis/analysis.py` and "Starlink unit economics" in the README.
 
 Rendered version: paste this file's contents into the [Mermaid Live Editor](https://mermaid.live) or view directly on GitHub, which renders ` ```mermaid ` code blocks natively in Markdown.

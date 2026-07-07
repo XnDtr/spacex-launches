@@ -16,6 +16,22 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import pandas as pd
 
+# Q6 unit-economics assumptions -- no API publishes Starlink subscription
+# pricing or per-satellite economics, so these are documented, cited
+# estimates, not measured data. See README "Starlink unit economics" for
+# full sourcing. Fleet-wide (not band-dependent): the same cost is compared
+# against every band's estimated revenue/satellite.
+BUILD_COST_USD_PER_SAT = 500_000.0  # publicly reported v1.5/v2-Mini build cost estimate
+LAUNCH_COST_USD = 20_000_000.0      # SpaceX-internal reused-booster marginal launch cost estimate
+SATS_PER_LAUNCH = 22                # typical v2 Mini batch size (reported range: 20-24)
+COST_USD_PER_SAT = BUILD_COST_USD_PER_SAT + LAUNCH_COST_USD / SATS_PER_LAUNCH
+
+# Assumed average concurrent per-user bandwidth allocation, used to convert a
+# satellite's raw throughput into a max-customers estimate. Real usage varies
+# a lot by time of day/congestion; this is a simplifying constant applied
+# uniformly across bands.
+AVG_USER_MBPS = 50.0
+
 
 def q1_success_rate_by_year(conn: sqlite3.Connection) -> pd.DataFrame:
     """Q1 (pure SQL) -- Has SpaceX's launch success rate improved over time?
@@ -195,6 +211,75 @@ def q5_starlink_altitude_and_cadence(conn: sqlite3.Connection, out_dir: pathlib.
     return df
 
 
+def q6_starlink_unit_economics(conn: sqlite3.Connection, out_dir: pathlib.Path) -> pd.DataFrame:
+    """Q6 (SQL + pandas) -- Which orbital bands generate the best revenue per
+    satellite relative to the (fixed) cost of building and launching one?
+
+    Why interesting: Starlink's margin isn't uniform across the constellation
+    -- a satellite serving a premium/low-competition market recoups its
+    build+launch cost far faster than one serving a low-price market, even
+    though every satellite costs about the same to build and launch. This is
+    a back-of-envelope model, not verified financials: no API publishes
+    Starlink subscription pricing or per-satellite economics, so both the
+    regional prices and the per-satellite customer capacity are documented
+    assumptions (see README "Starlink unit economics" for full sourcing).
+    "Customers per satellite" is estimated as raw throughput / an assumed
+    average per-user bandwidth, held constant per band. "Regional flyover
+    band" is defined by orbital inclination (the max latitude a satellite's
+    ground track reaches), not by country, since that's directly computable
+    from the ingested starlink.inclination_deg column -- real subscription
+    prices vary by country, so each band's price is a blended estimate
+    across its representative markets (see starlink_pricing_bands.notes).
+    """
+    sql = """
+        SELECT
+            b.band_name,
+            b.min_inclination_deg,
+            b.max_inclination_deg,
+            b.monthly_price_usd,
+            b.sat_throughput_gbps,
+            COUNT(s.starlink_id) AS active_satellites
+        FROM starlink_pricing_bands b
+        LEFT JOIN starlink s
+            ON s.inclination_deg BETWEEN b.min_inclination_deg AND b.max_inclination_deg
+            AND s.decayed = 0
+        GROUP BY b.band_name, b.min_inclination_deg, b.max_inclination_deg,
+                 b.monthly_price_usd, b.sat_throughput_gbps
+        ORDER BY b.min_inclination_deg;
+    """
+    df = pd.read_sql_query(sql, conn)
+    df["avg_users_per_sat"] = (df["sat_throughput_gbps"] * 1000 / AVG_USER_MBPS).round(0)
+    df["monthly_rev_per_sat_usd"] = (df["avg_users_per_sat"] * df["monthly_price_usd"]).round(0)
+    df["payback_months"] = (COST_USD_PER_SAT / df["monthly_rev_per_sat_usd"]).round(1)
+
+    print("\n=== Q6: Starlink unit economics by orbital band (SQL + pandas) ===")
+    print(sql)
+    print(
+        f"Assumptions: ${COST_USD_PER_SAT:,.0f}/satellite build+launch cost, "
+        f"{AVG_USER_MBPS:.0f} Mbps/user -- see README for sourcing."
+    )
+    print(df.to_string(index=False))
+
+    fig, axes = plt.subplots(1, 2, figsize=(12, 5))
+
+    axes[0].bar(df["band_name"], df["monthly_rev_per_sat_usd"], color="steelblue")
+    axes[0].set_ylabel("Monthly revenue / satellite (USD, est.)")
+    axes[0].set_title("Estimated revenue per satellite, by orbital band")
+    plt.setp(axes[0].get_xticklabels(), rotation=25, ha="right")
+
+    axes[1].bar(df["band_name"], df["payback_months"], color="darkorange")
+    axes[1].set_ylabel("Months to recoup build + launch cost")
+    axes[1].set_title(f"Payback period (cost/sat = ${COST_USD_PER_SAT:,.0f}, est.)")
+    plt.setp(axes[1].get_xticklabels(), rotation=25, ha="right")
+
+    fig.tight_layout()
+    out_path = out_dir / "q6_starlink_unit_economics.png"
+    fig.savefig(out_path, dpi=120)
+    plt.close(fig)
+    print(f"Saved chart: {out_path}")
+    return df
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--db", default="spacex.db")
@@ -210,6 +295,7 @@ def main() -> None:
     q3_launchpad_success_trend(conn)
     q4_payload_mass_by_orbit(conn, out_dir)
     q5_starlink_altitude_and_cadence(conn, out_dir)
+    q6_starlink_unit_economics(conn, out_dir)
     conn.close()
 
 

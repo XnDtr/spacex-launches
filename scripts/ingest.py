@@ -30,6 +30,10 @@ Per table:
   `_celestrak_to_starlink_records()` -- it reshapes Celestrak's fields into
   the same spaceTrack-nested shape `_starlink_row()` already expects, so
   that mapper (and its tests) are unchanged too.
+- starlink_pricing_bands: hand-curated (`PRICING_BANDS_SEED`), like
+  launchpads/landpads. No API publishes Starlink subscription pricing or
+  per-satellite economics; this backs the Q6 unit-economics analysis in
+  `analysis/analysis.py`. See README "Starlink unit economics" for sourcing.
 
 Idempotency strategy
 ---------------------
@@ -179,6 +183,45 @@ LANDPADS_SEED: list[JsonRecord] = [
     },
 ]
 
+# Hand-curated Starlink unit-economics reference data (Q6, analysis/analysis.py)
+# -- no API provides Starlink subscription pricing or per-satellite economics,
+# so this is a back-of-envelope model, not measured data. Bands are keyed by
+# orbital inclination (bounds the max latitude a satellite's ground track
+# reaches -- directly comparable to starlink.inclination_deg) rather than by
+# country/continent, since real prices vary by country while this project has
+# no ground-coverage model to map an orbit to specific countries. Each band's
+# monthly_price_usd is a blended figure across that band's representative
+# markets; sat_throughput_gbps is the publicly reported figure for the
+# satellite generation that predominantly flies at that inclination. Full
+# citations: see README "Starlink unit economics".
+PRICING_BANDS_SEED: list[JsonRecord] = [
+    {
+        "band_name": "Equatorial (<40 deg)", "min_inclination_deg": 0.0, "max_inclination_deg": 40.0,
+        "monthly_price_usd": 32.0, "sat_throughput_gbps": 20.0,
+        "notes": "Blended residential price across low-inclination-covered markets (Nigeria, Kenya, "
+                 "Brazil, Rwanda ~ $27-38/mo); throughput reflects a v1.5-class shell (~33 deg).",
+    },
+    {
+        "band_name": "Mid-latitude (40-60 deg)", "min_inclination_deg": 40.0, "max_inclination_deg": 60.0,
+        "monthly_price_usd": 95.0, "sat_throughput_gbps": 60.0,
+        "notes": "Blended core-market residential price (US tiered $55-130/mo, UK/EU ~$50-100/mo); "
+                 "covers the bulk of the constellation (53/53.2 deg shells, v2 Mini-class, ~60 Gbps).",
+    },
+    {
+        "band_name": "High-latitude (60-85 deg)", "min_inclination_deg": 60.0, "max_inclination_deg": 85.0,
+        "monthly_price_usd": 115.0, "sat_throughput_gbps": 60.0,
+        "notes": "Assumed ~1.2x mid-latitude price for remote high-latitude markets (northern Canada, "
+                 "Scandinavia, Patagonia) with less competition -- not a directly sourced figure.",
+    },
+    {
+        "band_name": "Polar (85+ deg)", "min_inclination_deg": 85.0, "max_inclination_deg": 100.0,
+        "monthly_price_usd": 250.0, "sat_throughput_gbps": 60.0,
+        "notes": "Approximates Starlink's Mobility/Maritime/Priority tier, which is what the "
+                 "near-polar shell (~97.6 deg) primarily serves -- a rough placeholder, not a "
+                 "published rate card.",
+    },
+]
+
 # Rough floors used only to flag a suspiciously small response (e.g. an error
 # page or an empty result) -- not validated against a live pull, so treat as
 # a sanity check to revisit once real counts are known.
@@ -191,6 +234,7 @@ MIN_EXPECTED_COUNTS: dict[str, int] = {
     "launches": 100,
     "payloads": 100,
     "starlink": 500,
+    "starlink_pricing_bands": 1,
 }
 
 logger = logging.getLogger("spacex_ingest")
@@ -591,6 +635,36 @@ def _landpad_row(r: JsonRecord) -> Row:
     }
 
 
+def load_pricing_bands(conn: sqlite3.Connection, rows: list[JsonRecord]) -> None:
+    conn.executemany(
+        """
+        INSERT INTO starlink_pricing_bands (
+            band_name, min_inclination_deg, max_inclination_deg,
+            monthly_price_usd, sat_throughput_gbps, notes
+        ) VALUES (
+            :band_name, :min_inclination_deg, :max_inclination_deg,
+            :monthly_price_usd, :sat_throughput_gbps, :notes
+        )
+        ON CONFLICT(band_name) DO UPDATE SET
+            min_inclination_deg=excluded.min_inclination_deg,
+            max_inclination_deg=excluded.max_inclination_deg,
+            monthly_price_usd=excluded.monthly_price_usd,
+            sat_throughput_gbps=excluded.sat_throughput_gbps,
+            notes=excluded.notes, last_ingested_at=CURRENT_TIMESTAMP
+        """,
+        safe_map(rows, _pricing_band_row, "starlink_pricing_bands"),
+    )
+
+
+def _pricing_band_row(r: JsonRecord) -> Row:
+    return {
+        "band_name": r["band_name"], "min_inclination_deg": r["min_inclination_deg"],
+        "max_inclination_deg": r["max_inclination_deg"],
+        "monthly_price_usd": r["monthly_price_usd"],
+        "sat_throughput_gbps": r["sat_throughput_gbps"], "notes": r.get("notes"),
+    }
+
+
 def load_capsules(conn: sqlite3.Connection, rows: list[JsonRecord]) -> None:
     conn.executemany(
         """
@@ -964,6 +1038,7 @@ LOADERS: dict[str, Callable[[sqlite3.Connection, list[JsonRecord]], None]] = {
     "launches": load_launches,
     "payloads": load_payloads,
     "starlink": load_starlink,
+    "starlink_pricing_bands": load_pricing_bands,
 }
 
 
@@ -1104,6 +1179,16 @@ def _run_ingest(
         starlink = limited(starlink)
         LOADERS["starlink"](conn, starlink)
         logger.info("  loaded %d starlink record(s)", len(starlink))
+
+    with conn:
+        logger.info(
+            "Loading starlink_pricing_bands (hand-curated unit-economics assumptions, "
+            "not fetched -- see README) ..."
+        )
+        validate_response("starlink_pricing_bands", PRICING_BANDS_SEED)
+        pricing_bands = limited(PRICING_BANDS_SEED)
+        LOADERS["starlink_pricing_bands"](conn, pricing_bands)
+        logger.info("  loaded %d starlink_pricing_bands record(s)", len(pricing_bands))
 
     # Only reached if every table above committed -- see the ingest_runs
     # comment in schema.sql for why this matters.

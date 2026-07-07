@@ -49,7 +49,7 @@ pip install -r requirements.txt
 python scripts/ingest.py --db spacex.db
 ```
 
-This creates `spacex.db`, applies `sql/schema.sql`, then loads all 8 tables
+This creates `spacex.db`, applies `sql/schema.sql`, then loads all 9 tables
 and logs (to stdout and to `ingest.log`) the total raw bytes downloaded and
 the row count loaded per table. **The source per table is no longer uniformly
 "the live SpaceX API"** (see "Known data quality" below for why and the full
@@ -61,6 +61,7 @@ per-table breakdown) — at a glance:
 | launchpads, landpads | hand-seeded (no live/cached source exists) |
 | cores | derived id-only stubs from `launches` (no live/cached source exists) |
 | starlink | **live** — Celestrak GP elements + SATCAT |
+| starlink_pricing_bands | hand-curated unit-economics assumptions (see "Starlink unit economics" below) |
 
 Only `starlink` still involves a live network fetch of fresh data on every
 run; the rest replay a frozen snapshot since the original source is gone.
@@ -105,8 +106,8 @@ constraints on boolean columns, `last_ingested_at` audit columns, and why
 python analysis/analysis.py --db spacex.db --out analysis/output
 ```
 
-Prints the three SQL question results (with the raw SQL shown) to stdout, and
-saves two PNG charts from the pandas questions to `analysis/output/`.
+Prints the SQL question results (with the raw SQL shown) to stdout, and
+saves three PNG charts from the pandas questions to `analysis/output/`.
 
 ### Questions answered
 
@@ -122,6 +123,10 @@ saves two PNG charts from the pandas questions to `analysis/output/`.
 5. **(pandas + matplotlib)** What does the Starlink constellation's altitude
    distribution look like, and how fast is it being launched (satellites per
    month)?
+6. **(SQL + pandas)** Which orbital bands generate the best revenue per
+   satellite relative to the fixed cost of building and launching one? A
+   back-of-envelope unit-economics model — see "Starlink unit economics"
+   below for the full assumptions and sourcing.
 
 Rationale for each is inline as a docstring above the corresponding function
 in `analysis/analysis.py`.
@@ -153,11 +158,12 @@ CI (`.github/workflows/tests.yml`) runs all of the above on every push/PR,
 plus an independent check that `sql/schema.sql` builds cleanly on its own
 (not just indirectly via the Python test suite).
 
-## Sample output (real run, 2026-07-05)
+## Sample output (real run, 2026-07-06)
 
 Row counts: 4 rockets, 4 launchpads, 7 landpads, 25 capsules, 78 core stubs,
 205 launches, 225 payloads, 12,340 starlink satellites (~10,700 active,
-~1,630 decayed) — **11.9MB raw downloaded**, clearing the >=10MB target.
+~1,630 decayed), 4 starlink_pricing_bands — **11.9MB raw downloaded**,
+clearing the >=10MB target.
 
 ```
 === Q1: Launch success rate by year ===
@@ -229,6 +235,51 @@ cause of a failed run. The SATCAT CSV has no such throttle.
   rather than coerced to 0.
 - `scripts/ingest.py` retries each network fetch up to 3x with backoff before
   raising a clear error.
+
+## Starlink unit economics (Q6)
+
+Q6 (`analysis/analysis.py`) estimates revenue per satellite vs. the fixed
+cost of building and launching one, broken out by **orbital band** — bands
+defined by inclination (the max latitude a satellite's ground track reaches),
+not by country, since that's directly computable from the ingested
+`starlink.inclination_deg` column with no ground-coverage model needed.
+**No API publishes Starlink subscription pricing or per-satellite
+economics** — every number below is a documented, cited, back-of-envelope
+estimate, not measured data or verified financials.
+
+| Band | Inclination | Real shell(s) | Monthly price (blended) | Throughput |
+|---|---|---|---|---|
+| Equatorial | 0–40° | ~33° (v1.5-class) | $32 — blended low-inclination-market residential price (Nigeria, Kenya, Brazil, Rwanda) | 20 Gbps |
+| Mid-latitude | 40–60° | 53°/53.2° (v2 Mini-class, bulk of the constellation) | $95 — blended core-market residential price (US, UK, EU) | 60 Gbps |
+| High-latitude | 60–85° | 70° | $115 — assumed ~1.2x mid-latitude for remote markets (northern Canada, Scandinavia, Patagonia); not directly sourced | 60 Gbps |
+| Polar | 85–100° | 97.6° | $250 — approximates the Mobility/Maritime/Priority tier this shell mostly serves; a rough placeholder, not a published rate card | 60 Gbps |
+
+Static seed data (`PRICING_BANDS_SEED` in `scripts/ingest.py`), loaded into
+`starlink_pricing_bands` the same way `LAUNCHPADS_SEED`/`LANDPADS_SEED` are.
+
+**Capacity model:** customers/satellite = throughput ÷ 50 Mbps assumed
+average concurrent per-user bandwidth (`AVG_USER_MBPS` in
+`analysis/analysis.py`) — a simplifying constant; real per-user throughput
+varies a lot with time of day and congestion.
+
+**Cost model:** $500,000 build cost + ($20,000,000 marginal reused-booster
+Falcon 9 launch cost ÷ 22 satellites/launch) ≈ **$1.41M/satellite**
+(`BUILD_COST_USD_PER_SAT`/`LAUNCH_COST_USD`/`SATS_PER_LAUNCH` in
+`analysis/analysis.py`), applied uniformly across bands.
+
+**Sources:**
+- Build cost: [Starlink is Now the SpaceX Cash Machine — NextBigFuture](https://www.nextbigfuture.com/2025/08/starlink-is-now-the-spacex-cash-machine.html)
+- Launch cost & satellites/launch: [Starlink — Unit Economics — SpaceXChart](https://spacexchart.com/starlink), [Falcon 9 — Orbital Radar](https://orbitalradar.com/launch-vehicles/falcon-9)
+- Regional pricing: [Starlink Prices by Country](https://www.starlink-prices.com/), [How affordable is Starlink? — Intermedia](https://iicintermedia.org/vol-53-issue-2/how-affordable-is-starlink/)
+- Throughput: [Modeling Starlink capacity — Mike Puchol](https://mikepuchol.com/modeling-starlink-capacity-843b2387f501), [Starlink Orbital Capacity — NextBigFuture](https://www.nextbigfuture.com/2023/12/spacex-starlink-orbital-capacity-and-usable-capacity.html)
+
+**A real finding from running this against live data:** the Equatorial
+band currently has **zero active satellites** (all ~10,700 active satellites
+in the live Celestrak pull fall in the mid-latitude/high-latitude/polar
+bands) — so its revenue/payback numbers are presently hypothetical, not a
+reflection of an operating shell. This is exactly the kind of thing a
+back-of-envelope model surfaces rather than hides: SpaceX doesn't appear to
+be currently operating a shell below 40° inclination.
 
 ## Known limitations
 
