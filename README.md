@@ -7,28 +7,16 @@ of analytical questions with SQL and pandas.
 
 ## Dataset choice
 
-- **Source (originally):** `https://api.spacexdata.com/v4/*` — public REST
-  API, no auth, no rate-limit key required. Docs:
-  https://github.com/r-spacex/SpaceX-API/tree/master/docs
-- **Why this dataset:** naturally relational (launches reference rockets,
-  launchpads, cores, capsules, and payloads), long enough history (2006 to
-  present) to support trend analysis, and well-documented field semantics.
-- **The live API is now dead (discovered 2026-07-05) — see "Known data
-  quality" below for the full story and per-table fallback sourcing.** In
-  short: the source repo was archived and the hosted API returns Cloudflare
-  525 (origin unreachable) on every endpoint, with no sign of recovery. Rather
-  than abandon a dataset whose schema/ingestion/analysis were already fully
-  built out, each table now has its own real (not synthetic) fallback source:
-  a Wayback Machine snapshot, a small hand-verified seed, a derived stub, or —
-  for `starlink` — a live replacement source (Celestrak).
-- **Meeting the >=10MB raw requirement:** now driven by `starlink`'s live
-  Celestrak sourcing (~10,700 active + ~1,600 decayed Starlink satellites)
-  rather than the original spaceTrack-shaped endpoint — see "Known data
-  quality" for the breakdown.
-- **Repo note:** the archived `r-spacex/SpaceX-API` GitHub repo (source of the
-  hosted API) was marked read-only/archived on 2026-06-06, and by 2026-07-05
-  the hosted API itself had gone down too (see below) — status page:
-  https://status.spacexdata.com.
+**Source:** [SpaceX API v4](https://github.com/r-spacex/SpaceX-API) (docs:
+`docs/` in that repo) — naturally relational (launches reference rockets,
+launchpads, cores, capsules, payloads), long history (2006–present) for trend
+analysis, well-documented fields.
+
+**The live API died mid-build** (source repo archived, hosted API now returns
+Cloudflare 525 on every endpoint). Each table now has its own real fallback
+(Wayback snapshot, hand-seeded, derived, or — for `starlink` — a live
+Celestrak feed that also covers the >=10MB raw-size requirement). Full story,
+per-table sourcing, and tradeoffs: see "Known data quality" below.
 
 ## Repo layout
 
@@ -86,14 +74,9 @@ what gets written to SQLite):
 python scripts/ingest.py --db /tmp/smoke.db --limit 5
 ```
 
-**Malformed/unexpected records don't abort a run.** Each record is parsed
-individually; one that doesn't match the expected shape (missing field,
-unexpected type) is logged as a warning and skipped rather than crashing the
-whole endpoint's load. `validate_response()` also fails fast if an endpoint
-ever returns something other than a plain JSON array (e.g. an error page, or
-the paginated `{docs: [...]}` shape used by the API's POST `/query` variant),
-and warns if a response looks suspiciously small relative to known SpaceX
-launch history.
+**Malformed records don't abort a run** — each is parsed individually, logged,
+and skipped (see `safe_map()`/`validate_response()` in `ingest.py` for the
+full shape/size checks).
 
 **Idempotency:** every top-level table is keyed by the API's natural id and
 loaded via `INSERT ... ON CONFLICT DO UPDATE`. Child collections that don't
@@ -112,14 +95,9 @@ sqlite3 spacex.db "SELECT COUNT(*) FROM launches;"   # count unchanged
 Open `sql/er_diagram.md` on GitHub (renders Mermaid natively) or paste its
 contents into https://mermaid.live.
 
-Notes on the schema itself (see the header comment in `sql/schema.sql` for
-more): boolean-ish columns (`success`, `reused`, `decayed`, etc.) have
-`CHECK (col IN (0,1))` constraints so a bad value fails at write time instead
-of silently corrupting an aggregate later; every top-level table has a
-`last_ingested_at` audit column updated on every upsert so you can tell when
-a row was last refreshed; and the `ships`/`crew` API endpoints are
-deliberately out of scope (documented in the schema header) since nothing in
-this project's analysis needs them.
+See the header comment in `sql/schema.sql` for design notes (CHECK
+constraints on boolean columns, `last_ingested_at` audit columns, and why
+`ships`/`crew` are out of scope).
 
 ## Run the analysis
 
@@ -177,11 +155,9 @@ plus an independent check that `sql/schema.sql` builds cleanly on its own
 
 ## Sample output (real run, 2026-07-05)
 
-Real output from `ingest.py` + `analysis.py` against the fallback sources
-described above (Wayback Machine + hand-seeded pads + Celestrak). Row counts:
-4 rockets, 4 launchpads, 7 landpads, 25 capsules, 78 core stubs, 205 launches,
-225 payloads, 12,340 starlink satellites (~10,700 active, ~1,630 decayed) —
-**11.9MB raw downloaded**, clearing the >=10MB target.
+Row counts: 4 rockets, 4 launchpads, 7 landpads, 25 capsules, 78 core stubs,
+205 launches, 225 payloads, 12,340 starlink satellites (~10,700 active,
+~1,630 decayed) — **11.9MB raw downloaded**, clearing the >=10MB target.
 
 ```
 === Q1: Launch success rate by year ===
@@ -191,43 +167,17 @@ year  total_launches  successful  success_rate_pct
 2020              26          26             100.0
 2021              31          31             100.0
 2022              43          43             100.0
-
-=== Q3: Launchpad success-rate trend, year over year (CTE + JOIN + LAG window function) ===
-      launchpad year  total_launches  success_rate_pct  pct_pt_change_vs_prev_year
-   CCSFS SLC-40 2020              14             100.0                         0.0
-   CCSFS SLC-40 2021              16             100.0                         0.0
-   CCSFS SLC-40 2022              21             100.0                         0.0
-     KSC LC-39A 2020              11             100.0                         0.0
-     KSC LC-39A 2021              12             100.0                         0.0
-    VAFB SLC-4E 2021               3             100.0                         0.0
-    VAFB SLC-4E 2022               8             100.0                         0.0
-
-=== Q5: Starlink altitude distribution & launch cadence (pandas) ===
-count    12339.000000
-mean       442.399834
-std        116.792677
-min         91.000000
-max        581.700376
-
-Saved chart: analysis/output/q4_payload_mass_by_orbit.png
-Saved chart: analysis/output/q5_starlink_altitude_cadence.png
 ```
 
-Q3's launchpad names (`CCSFS SLC-40`, `KSC LC-39A`, `VAFB SLC-4E`, `Kwajalein
-Atoll`) are the hand-seeded rows described above, joining correctly against
-real launch history — a working end-to-end check that the id -> site mapping
-reconstruction was right. The Q5 altitude histogram shows distinct clusters
-around the ~350km (early, now-decaying shells) and ~530-560km (current main
-shells) — matches publicly known Starlink orbital shell design.
+Full Q1–Q5 output (including Q3's per-pad trend table and Q5's altitude
+stats) is reproduced by running `analysis/analysis.py` per above.
 
-**One more data-freshness wrinkle found during this run:** despite the
-`launches`/`payloads`/`rockets`/`capsules` Wayback snapshots being crawled in
-Feb 2026 / Aug 2024, the underlying data inside them is effectively frozen
-around **October 2022** (latest resolved launch: Crew-5, 2022-10-05; 18
-"upcoming" launches beyond that never got backfilled with real outcomes). The
-community-run dataset behind the archived API had apparently stopped being
-updated well before the API itself went fully dark — Q1/Q3 above reflect
-launch history only through 2022, not through the outage date.
+Two things worth noting from this run: the Q3 pad names join correctly
+against the hand-seeded launchpads, confirming the id → site mapping is
+right, and the Wayback-sourced `launches`/`payloads` data turns out to be
+frozen around **October 2022** (latest resolved launch: Crew-5) — the
+community dataset behind the archived API had apparently stopped updating
+before the API itself went dark, so Q1/Q3 reflect history only through 2022.
 
 ## Known data quality / API notes
 

@@ -1001,6 +1001,33 @@ def main() -> None:
     # re-fetching/re-loading tables that already succeeded on retry.
     total_raw_bytes = 0
 
+    try:
+        total_raw_bytes = _run_ingest(conn, truncated, limited, total_raw_bytes)
+    except Exception as exc:
+        # Tables already committed above (each is its own `with conn` block)
+        # are unaffected -- only ingest_runs, written last, is left stale,
+        # which is exactly the partial-run signal described in schema.sql.
+        # Logging cleanly + a plain exit code beats an unhandled traceback,
+        # since this is routinely a known, actionable failure (e.g.
+        # Celestrak's throttle below) rather than a bug.
+        logger.error("Ingestion aborted: %s", exc)
+        raise SystemExit(1) from None
+    finally:
+        conn.close()
+
+    logger.info(
+        "Total raw bytes downloaded: %.2f MB (Wayback Machine + Celestrak; excludes the "
+        "hand-seeded launchpads/landpads and derived cores stubs, which aren't network-fetched)",
+        total_raw_bytes / 1_000_000,
+    )
+
+
+def _run_ingest(
+    conn: sqlite3.Connection,
+    truncated: bool,
+    limited: Callable[[list[JsonRecord]], list[JsonRecord]],
+    total_raw_bytes: int,
+) -> int:
     with conn:
         logger.info("Fetching rockets (Wayback Machine snapshot -- live API is down, see README) ...")
         rockets, n = fetch_wayback("rockets")
@@ -1086,12 +1113,7 @@ def main() -> None:
             "ON CONFLICT(id) DO UPDATE SET completed_at = excluded.completed_at"
         )
 
-    logger.info(
-        "Total raw bytes downloaded: %.2f MB (Wayback Machine + Celestrak; excludes the "
-        "hand-seeded launchpads/landpads and derived cores stubs, which aren't network-fetched)",
-        total_raw_bytes / 1_000_000,
-    )
-    conn.close()
+    return total_raw_bytes
 
 
 if __name__ == "__main__":
