@@ -32,6 +32,11 @@ COST_USD_PER_SAT = BUILD_COST_USD_PER_SAT + LAUNCH_COST_USD / SATS_PER_LAUNCH
 # uniformly across bands.
 AVG_USER_MBPS = 50.0
 
+# SpaceX's own reported Starlink revenue, used only as a sanity check on Q6's
+# modeled numbers (see the print in q6_starlink_unit_economics). Source:
+# https://spacenews.com/starlink-soars-spacexs-satellite-internet-surprises-analysts-with-6-6-billion-revenue-projection/
+STARLINK_REPORTED_ANNUAL_REVENUE_USD = 6_600_000_000.0
+
 
 def q1_success_rate_by_year(conn: sqlite3.Connection, out_dir: pathlib.Path) -> pd.DataFrame:
     """Q1 (pure SQL) -- Has SpaceX's launch success rate improved over time?
@@ -279,6 +284,19 @@ def q6_starlink_unit_economics(conn: sqlite3.Connection, out_dir: pathlib.Path) 
     from the ingested starlink.inclination_deg column -- real subscription
     prices vary by country, so each band's price is a blended estimate
     across its representative markets (see starlink_pricing_bands.notes).
+
+    Caveats printed at runtime: (1) the capacity model assumes every
+    satellite is fully saturated with paying customers, which overstates
+    absolute revenue (the printed reality-check compares implied fleet-wide
+    revenue against SpaceX's own reported figure). (2) sat_throughput_gbps is
+    currently identical (60 Gbps) across all three *populated* bands, so the
+    payback ranking between them follows directly from the hand-curated
+    price assumption alone -- it would be unchanged even without querying
+    the database. What Q6 does contribute empirically is which bands have
+    real satellites in them at all: `active_satellites` is a genuine
+    query result, and the equatorial band's count of zero (a band this
+    model assumed would be populated) is the one finding here that the
+    data itself, not the price table, is responsible for.
     """
     sql = """
         SELECT
@@ -290,7 +308,8 @@ def q6_starlink_unit_economics(conn: sqlite3.Connection, out_dir: pathlib.Path) 
             COUNT(s.starlink_id) AS active_satellites
         FROM starlink_pricing_bands b
         LEFT JOIN starlink s
-            ON s.inclination_deg BETWEEN b.min_inclination_deg AND b.max_inclination_deg
+            ON s.inclination_deg >= b.min_inclination_deg
+            AND s.inclination_deg <  b.max_inclination_deg
             AND s.decayed = 0
         GROUP BY b.band_name, b.min_inclination_deg, b.max_inclination_deg,
                  b.monthly_price_usd, b.sat_throughput_gbps
@@ -301,6 +320,17 @@ def q6_starlink_unit_economics(conn: sqlite3.Connection, out_dir: pathlib.Path) 
     df["monthly_rev_per_sat_usd"] = (df["avg_users_per_sat"] * df["monthly_price_usd"]).round(0)
     df["payback_months"] = (COST_USD_PER_SAT / df["monthly_rev_per_sat_usd"]).round(1)
 
+    # Bands are half-open [min, max) specifically so a satellite on a shared
+    # edge (e.g. exactly 60.0 deg) can't double-count into two bands -- this
+    # is the invariant that guarantees, not just a sanity check on today's
+    # data (see PRICING_BANDS_SEED comment in ingest.py).
+    active_total = conn.execute("SELECT COUNT(*) FROM starlink WHERE decayed = 0").fetchone()[0]
+    banded_total = int(df["active_satellites"].sum())
+    assert banded_total == active_total, (
+        f"Q6 bands cover {banded_total} active satellites but {active_total} exist -- "
+        "a band boundary gap or overlap would show up as a mismatch here."
+    )
+
     print("\n=== Q6: Starlink unit economics by orbital band (SQL + pandas) ===")
     print(sql)
     print(
@@ -308,6 +338,21 @@ def q6_starlink_unit_economics(conn: sqlite3.Connection, out_dir: pathlib.Path) 
         f"{AVG_USER_MBPS:.0f} Mbps/user -- see README for sourcing."
     )
     print(df.to_string(index=False))
+    print(f"Band coverage check: {banded_total}/{active_total} active satellites banded exactly once.")
+
+    implied_annual_revenue = (df["monthly_rev_per_sat_usd"] * df["active_satellites"]).sum() * 12
+    print(
+        f"Reality check: this model implies ~${implied_annual_revenue / 1e9:.1f}B/yr fleet-wide "
+        f"revenue, vs. SpaceX's own reported ~${STARLINK_REPORTED_ANNUAL_REVENUE_USD / 1e9:.1f}B/yr "
+        f"({implied_annual_revenue / STARLINK_REPORTED_ANNUAL_REVENUE_USD:.1f}x too high) -- the "
+        "full-saturation assumption overstates absolute revenue/payback."
+    )
+    print(
+        "Caveat: sat_throughput_gbps is identical across all populated bands here, so the payback "
+        "*ranking* between them follows from the price assumption alone, not from anything in the "
+        "database -- the one query result the data itself is responsible for is which bands have "
+        "satellites in them at all (active_satellites, e.g. equatorial's 0)."
+    )
 
     fig, axes = plt.subplots(1, 2, figsize=(12, 5))
 

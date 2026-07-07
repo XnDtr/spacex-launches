@@ -194,6 +194,13 @@ LANDPADS_SEED: list[JsonRecord] = [
 # markets; sat_throughput_gbps is the publicly reported figure for the
 # satellite generation that predominantly flies at that inclination. Full
 # citations: see README "Starlink unit economics".
+#
+# Bands are half-open [min, max) -- analysis.py's Q6 query joins on
+# `inclination_deg >= min AND inclination_deg < max`, not BETWEEN, so a
+# satellite sitting exactly on a shared edge (40.0/60.0/85.0 deg) counts in
+# exactly one band, not two. The last band's max is 180.0 (inclination's true
+# ceiling), not the "100" the "Polar (85+ deg)" label implies, so the
+# half-open rule never excludes a real near-polar/retrograde satellite.
 PRICING_BANDS_SEED: list[JsonRecord] = [
     {
         "band_name": "Equatorial (<40 deg)", "min_inclination_deg": 0.0, "max_inclination_deg": 40.0,
@@ -214,7 +221,7 @@ PRICING_BANDS_SEED: list[JsonRecord] = [
                  "Scandinavia, Patagonia) with less competition -- not a directly sourced figure.",
     },
     {
-        "band_name": "Polar (85+ deg)", "min_inclination_deg": 85.0, "max_inclination_deg": 100.0,
+        "band_name": "Polar (85+ deg)", "min_inclination_deg": 85.0, "max_inclination_deg": 180.0,
         "monthly_price_usd": 250.0, "sat_throughput_gbps": 60.0,
         "notes": "Approximates Starlink's Mobility/Maritime/Priority tier, which is what the "
                  "near-polar shell (~97.6 deg) primarily serves -- a rough placeholder, not a "
@@ -1069,15 +1076,13 @@ def main() -> None:
     # symptom -- a missing parent id -- for very different reasons).
     truncated = args.limit is not None
 
-    # Each table commits independently (rather than one all-or-nothing
-    # transaction for the whole run) -- sources are now heterogeneous
-    # (Wayback/hand-seeded/derived/live Celestrak), so a transient failure
-    # in one (e.g. Celestrak's throttle, see below) shouldn't force
-    # re-fetching/re-loading tables that already succeeded on retry.
-    total_raw_bytes = 0
-
     try:
-        total_raw_bytes = _run_ingest(conn, truncated, limited, total_raw_bytes)
+        # Each table commits independently (rather than one all-or-nothing
+        # transaction for the whole run) -- sources are now heterogeneous
+        # (Wayback/hand-seeded/derived/live Celestrak), so a transient failure
+        # in one (e.g. Celestrak's throttle, see below) shouldn't force
+        # re-fetching/re-loading tables that already succeeded on retry.
+        total_raw_bytes = _run_ingest(conn, truncated, limited)
     except Exception as exc:
         # Tables already committed above (each is its own `with conn` block)
         # are unaffected -- only ingest_runs, written last, is left stale,
@@ -1101,8 +1106,9 @@ def _run_ingest(
     conn: sqlite3.Connection,
     truncated: bool,
     limited: Callable[[list[JsonRecord]], list[JsonRecord]],
-    total_raw_bytes: int,
 ) -> int:
+    total_raw_bytes = 0
+
     with conn:
         logger.info("Fetching rockets (Wayback Machine snapshot -- live API is down, see README) ...")
         rockets, n = fetch_wayback("rockets")

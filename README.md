@@ -136,7 +136,9 @@ in `analysis/analysis.py`. Answers and charts for each are below.
 Static snapshots committed to `docs/images/` for display here — the pipeline
 itself never commits generated charts (see `analysis/output/` in
 `.gitignore`); re-run `analysis/analysis.py` per above to regenerate fresh
-ones from your own database.
+ones from your own database. This is a deliberate, disclosed exception to
+"the repo should contain only code and small config" — six small PNGs kept
+purely so the analysis is visible without cloning and running anything.
 
 #### Q1 — launch volume and success rate by year
 
@@ -187,11 +189,12 @@ climbed roughly 5-6x, from ~60/month in 2019-2020 to 300+ in some months by
 
 ![Starlink revenue per satellite and payback period by orbital band](docs/images/q6_starlink_unit_economics.png)
 
-**Takeaway:** Polar pays back fastest (4.7 months, driven by premium
-Mobility/Maritime pricing) and mid-latitude slowest among populated bands
-(12.4 months, the largest but lowest-priced core market); the modeled
-equatorial band has zero active satellites today, so its 110-month payback
-is presently hypothetical, not observed.
+**Takeaway:** By the assumed prices, polar pays back fastest (4.7 months,
+premium Mobility/Maritime pricing) and mid-latitude slowest among populated
+bands (12.4 months); the real, data-driven finding is that the modeled
+equatorial band has **zero active satellites today**, so its 110-month
+payback is presently hypothetical. The ranking itself is price-driven, not
+data-driven — see "Starlink unit economics" below for both caveats in full.
 
 ## Tests
 
@@ -309,15 +312,20 @@ not by country, since that's directly computable from the ingested
 economics** — every number below is a documented, cited, back-of-envelope
 estimate, not measured data or verified financials.
 
-| Band | Inclination | Real shell(s) | Monthly price (blended) | Throughput |
+| Band | Inclination (half-open `[min, max)`) | Real shell(s) | Monthly price (blended) | Throughput |
 |---|---|---|---|---|
-| Equatorial | 0–40° | ~33° (v1.5-class) | $32 — blended low-inclination-market residential price (Nigeria, Kenya, Brazil, Rwanda) | 20 Gbps |
-| Mid-latitude | 40–60° | 53°/53.2° (v2 Mini-class, bulk of the constellation) | $95 — blended core-market residential price (US, UK, EU) | 60 Gbps |
-| High-latitude | 60–85° | 70° | $115 — assumed ~1.2x mid-latitude for remote markets (northern Canada, Scandinavia, Patagonia); not directly sourced | 60 Gbps |
-| Polar | 85–100° | 97.6° | $250 — approximates the Mobility/Maritime/Priority tier this shell mostly serves; a rough placeholder, not a published rate card | 60 Gbps |
+| Equatorial | [0°, 40°) | ~33° (v1.5-class) | $32 — blended low-inclination-market residential price (Nigeria, Kenya, Brazil, Rwanda) | 20 Gbps |
+| Mid-latitude | [40°, 60°) | 53°/53.2° (v2 Mini-class, bulk of the constellation) | $95 — blended core-market residential price (US, UK, EU) | 60 Gbps |
+| High-latitude | [60°, 85°) | 70° | $115 — assumed ~1.2x mid-latitude for remote markets (northern Canada, Scandinavia, Patagonia); not directly sourced | 60 Gbps |
+| Polar | [85°, 180°) | 97.6° | $250 — approximates the Mobility/Maritime/Priority tier this shell mostly serves; a rough placeholder, not a published rate card | 60 Gbps |
 
 Static seed data (`PRICING_BANDS_SEED` in `scripts/ingest.py`), loaded into
 `starlink_pricing_bands` the same way `LAUNCHPADS_SEED`/`LANDPADS_SEED` are.
+Bands are **half-open** (`inclination_deg >= min AND < max` in the Q6 query,
+not `BETWEEN`) specifically so a satellite sitting exactly on a shared edge
+(40°/60°/85°) counts in exactly one band, not two — the query asserts this
+invariant at runtime (`active_satellites` summed across bands must equal the
+total active satellite count) rather than silently trusting it.
 
 **Capacity model:** customers/satellite = throughput ÷ 50 Mbps assumed
 average concurrent per-user bandwidth (`AVG_USER_MBPS` in
@@ -341,7 +349,25 @@ in the live Celestrak pull fall in the mid-latitude/high-latitude/polar
 bands) — so its revenue/payback numbers are presently hypothetical, not a
 reflection of an operating shell. This is exactly the kind of thing a
 back-of-envelope model surfaces rather than hides: SpaceX doesn't appear to
-be currently operating a shell below 40° inclination.
+be currently operating a shell below 40° inclination. It's also the *only*
+finding here that comes from the ingested data rather than the assumptions
+below — see the two caveats immediately following.
+
+**Two honesty caveats, both printed by `analysis.py` at runtime, not just
+documented here:**
+1. **Absolute numbers are optimistic.** The capacity model assumes every
+   satellite is fully saturated with paying customers. Multiplying modeled
+   revenue/satellite by active satellite count implies **~$17.8B/yr**
+   fleet-wide — about **2.7x** SpaceX's own reported **~$6.6B/yr** Starlink
+   revenue ([SpaceNews](https://spacenews.com/starlink-soars-spacexs-satellite-internet-surprises-analysts-with-6-6-billion-revenue-projection/)).
+   Treat absolute payback-month values as illustrative, not predictive.
+2. **The band ranking is price-driven, not data-driven.** `sat_throughput_gbps`
+   is currently identical (60 Gbps) across all three *populated* bands, so
+   "polar pays back fastest" follows directly from the hand-curated price
+   table alone — it would be unchanged even without querying `starlink` at
+   all. The one thing this query empirically contributes is *which bands
+   have satellites in them* (`active_satellites`), which is what makes the
+   equatorial finding above meaningful.
 
 ## Known limitations
 

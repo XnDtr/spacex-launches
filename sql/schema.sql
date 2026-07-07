@@ -253,6 +253,9 @@ CREATE TABLE IF NOT EXISTS starlink (
 -- per publicly reported figures for the satellite generation that mostly
 -- flies at that inclination. Full sourcing/citations: see README "Starlink
 -- unit economics". This is a back-of-envelope model, not verified financials.
+-- Bands are half-open [min, max) -- see analysis.py's Q6 query and the
+-- PRICING_BANDS_SEED comment in ingest.py for why (a satellite exactly on a
+-- shared edge like 60.0 deg must count in exactly one band, not two).
 -- ---------------------------------------------------------------------------
 
 CREATE TABLE IF NOT EXISTS starlink_pricing_bands (
