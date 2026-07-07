@@ -3,8 +3,8 @@
 Run after ingestion:
     python analysis/analysis.py [--db spacex.db] [--out analysis/output]
 
-Produces printed tables for the SQL questions and PNG charts for the pandas
-questions in --out (default: analysis/output/).
+Produces printed tables for every question (with the raw SQL shown for
+Q1-Q3, Q6) and a PNG chart per question in --out (default: analysis/output/).
 """
 import argparse
 import pathlib
@@ -33,7 +33,7 @@ COST_USD_PER_SAT = BUILD_COST_USD_PER_SAT + LAUNCH_COST_USD / SATS_PER_LAUNCH
 AVG_USER_MBPS = 50.0
 
 
-def q1_success_rate_by_year(conn: sqlite3.Connection) -> pd.DataFrame:
+def q1_success_rate_by_year(conn: sqlite3.Connection, out_dir: pathlib.Path) -> pd.DataFrame:
     """Q1 (pure SQL) -- Has SpaceX's launch success rate improved over time?
 
     Why interesting: reliability trend is the headline metric for a launch
@@ -56,10 +56,28 @@ def q1_success_rate_by_year(conn: sqlite3.Connection) -> pd.DataFrame:
     print("\n=== Q1: Launch success rate by year ===")
     print(sql)
     print(df.to_string(index=False))
+
+    fig, ax1 = plt.subplots(figsize=(8, 5))
+    ax1.bar(df["year"], df["total_launches"], color="lightsteelblue", label="Total launches")
+    ax1.set_xlabel("Year")
+    ax1.set_ylabel("Total launches")
+
+    ax2 = ax1.twinx()
+    ax2.plot(df["year"], df["success_rate_pct"], color="firebrick", marker="o", label="Success rate (%)")
+    ax2.set_ylabel("Success rate (%)")
+    ax2.set_ylim(0, 105)
+
+    fig.legend(loc="lower right", bbox_to_anchor=(0.9, 0.12))
+    ax1.set_title("Launch volume and success rate by year")
+    fig.tight_layout()
+    out_path = out_dir / "q1_success_rate_by_year.png"
+    fig.savefig(out_path, dpi=120)
+    plt.close(fig)
+    print(f"Saved chart: {out_path}")
     return df
 
 
-def q2_core_reuse_landing_success(conn: sqlite3.Connection) -> pd.DataFrame:
+def q2_core_reuse_landing_success(conn: sqlite3.Connection, out_dir: pathlib.Path) -> pd.DataFrame:
     """Q2 (pure SQL) -- Do more-reused boosters land as reliably as new ones?
 
     Why interesting: core reuse is the core (pun intended) of SpaceX's cost
@@ -84,10 +102,22 @@ def q2_core_reuse_landing_success(conn: sqlite3.Connection) -> pd.DataFrame:
     print("\n=== Q2: Landing success rate by core flight number (1st use, 2nd use, ...) ===")
     print(sql)
     print(df.to_string(index=False))
+
+    fig, ax = plt.subplots(figsize=(8, 5))
+    ax.bar(df["core_flight_num"].astype(str), df["landing_success_pct"], color="seagreen")
+    ax.set_xlabel("Core flight number (1st use, 2nd use, ...)")
+    ax.set_ylabel("Landing success rate (%)")
+    ax.set_ylim(0, 105)
+    ax.set_title("Landing success rate by booster reuse count")
+    fig.tight_layout()
+    out_path = out_dir / "q2_core_reuse_landing_success.png"
+    fig.savefig(out_path, dpi=120)
+    plt.close(fig)
+    print(f"Saved chart: {out_path}")
     return df
 
 
-def q3_launchpad_success_trend(conn: sqlite3.Connection) -> pd.DataFrame:
+def q3_launchpad_success_trend(conn: sqlite3.Connection, out_dir: pathlib.Path) -> pd.DataFrame:
     """Q3 (pure SQL, CTE + JOIN + window function) -- Which launchpads are
     trending better or worse year over year, and by how much?
 
@@ -124,6 +154,25 @@ def q3_launchpad_success_trend(conn: sqlite3.Connection) -> pd.DataFrame:
     print("\n=== Q3: Launchpad success-rate trend, year over year (CTE + JOIN + LAG window function) ===")
     print(sql)
     print(df.to_string(index=False))
+
+    fig, ax = plt.subplots(figsize=(8, 5))
+    # year is a string (substr() in the query above) -- plotting it directly
+    # gives matplotlib a categorical axis ordered by first appearance across
+    # groups, not chronological order (e.g. a pad whose data starts in 2006
+    # would have 2006-2009 appended after 2022 rather than sorted first).
+    # Casting to int forces a proper numeric, chronologically-sorted axis.
+    for launchpad, sub in df.groupby("launchpad"):
+        ax.plot(sub["year"].astype(int), sub["success_rate_pct"], marker="o", label=launchpad)
+    ax.set_xlabel("Year")
+    ax.set_ylabel("Success rate (%)")
+    ax.set_ylim(0, 105)
+    ax.set_title("Launchpad success-rate trend, year over year")
+    ax.legend(fontsize=8)
+    fig.tight_layout()
+    out_path = out_dir / "q3_launchpad_success_trend.png"
+    fig.savefig(out_path, dpi=120)
+    plt.close(fig)
+    print(f"Saved chart: {out_path}")
     return df
 
 
@@ -290,9 +339,9 @@ def main() -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
 
     conn = sqlite3.connect(args.db)
-    q1_success_rate_by_year(conn)
-    q2_core_reuse_landing_success(conn)
-    q3_launchpad_success_trend(conn)
+    q1_success_rate_by_year(conn, out_dir)
+    q2_core_reuse_landing_success(conn, out_dir)
+    q3_launchpad_success_trend(conn, out_dir)
     q4_payload_mass_by_orbit(conn, out_dir)
     q5_starlink_altitude_and_cadence(conn, out_dir)
     q6_starlink_unit_economics(conn, out_dir)

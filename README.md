@@ -106,8 +106,8 @@ constraints on boolean columns, `last_ingested_at` audit columns, and why
 python analysis/analysis.py --db spacex.db --out analysis/output
 ```
 
-Prints the SQL question results (with the raw SQL shown) to stdout, and
-saves three PNG charts from the pandas questions to `analysis/output/`.
+Prints every question's result (with the raw SQL shown for Q1-Q3, Q6) to
+stdout, and saves a PNG chart per question (six total) to `analysis/output/`.
 
 ### Questions answered
 
@@ -137,6 +137,18 @@ Static snapshots committed to `docs/images/` for display here — the pipeline
 itself never commits generated charts (see `analysis/output/` in
 `.gitignore`); re-run `analysis/analysis.py` per above to regenerate fresh
 ones from your own database.
+
+**Q1 — launch volume and success rate by year:**
+
+![Launch volume and success rate by year](docs/images/q1_success_rate_by_year.png)
+
+**Q2 — landing success rate by booster reuse count:**
+
+![Landing success rate by booster reuse count](docs/images/q2_core_reuse_landing_success.png)
+
+**Q3 — launchpad success-rate trend, year over year:**
+
+![Launchpad success-rate trend, year over year](docs/images/q3_launchpad_success_trend.png)
 
 **Q4 — payload mass to orbit over time:**
 
