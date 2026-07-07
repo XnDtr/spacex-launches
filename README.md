@@ -117,13 +117,13 @@ Each question below is followed by its one-line answer (from the real run in
 1. **(SQL)** Has SpaceX's launch success rate improved year over year?
    **Yes** — aside from a 2015-16 dip (85.7%/88.9%, both Falcon 9 loss-of-vehicle
    years), success rate has held at 100% every year since 2017, even as launch
-   cadence grew ~20x (1-2/year in 2006-2010 to 43 in 2022). → [Q1 chart](#q1-chart)
+   cadence grew ~20x (1-2/year in 2006-2010 to 43 in 2022). → [Q1 chart](#user-content-q1-chart)
 2. **(SQL)** Does landing success rate hold up as a booster core is reused
    more times (1st flight vs. 10th flight, etc.), or does it degrade?
    **It doesn't degrade** — landing success is lowest on a core's *first*
    flight (77.4%) and rises to 90-100% from the second flight onward, holding
    100% for flights 7 through 13. Reuse looks safer, not riskier, after the
-   first landing. → [Q2 chart](#q2-chart)
+   first landing. → [Q2 chart](#user-content-q2-chart)
 3. **(SQL — CTE + JOIN + window function)** Which launchpads are trending
    better or worse year over year, and by how much? Joins `launches` to
    `launchpads` and uses `LAG()` to compute each pad's change against its own
@@ -131,13 +131,13 @@ Each question below is followed by its one-line answer (from the real run in
    **Every currently-active pad converges on ~100%** in recent years; the only
    real volatility is CCSFS SLC-40's 2015-16 dip (85.7%/87.5%, the same
    fleet-wide dip from Q1 concentrated at one pad) and Kwajalein Atoll's rocky
-   2006-2009 ramp-up as SpaceX's first-ever launch site. → [Q3 chart](#q3-chart)
+   2006-2009 ramp-up as SpaceX's first-ever launch site. → [Q3 chart](#user-content-q3-chart)
 4. **(pandas + matplotlib)** How has payload mass to each orbit class (LEO,
    GTO, SSO, ...) evolved over time?
    **It's grown substantially for GTO** commercial payloads (roughly doubling
    from ~2,000-3,000 kg pre-2016 to ~5,000-7,000 kg by 2018-2022), and VLEO
    (Starlink batches) appears only from 2019 onward at a consistently high
-   ~13,000-15,600 kg per launch. → [Q4 chart](#q4-chart)
+   ~13,000-15,600 kg per launch. → [Q4 chart](#user-content-q4-chart)
 5. **(pandas + matplotlib)** What does the Starlink constellation's altitude
    distribution look like, and how fast is it being launched (satellites per
    month)?
@@ -145,7 +145,7 @@ Each question below is followed by its one-line answer (from the real run in
    shell, >5,000 of ~12,300 satellites), with smaller populations near
    ~150-200 km (older/decaying) and ~550-600 km; deployment cadence has
    climbed roughly 5-6x, from ~60/month in 2019-2020 to 300+ in some months by
-   2025-2026. → [Q5 chart](#q5-chart)
+   2025-2026. → [Q5 chart](#user-content-q5-chart)
 6. **(SQL + pandas)** Which orbital bands generate the best revenue per
    satellite relative to the fixed cost of building and launching one? A
    back-of-envelope unit-economics model — see "Starlink unit economics"
@@ -154,7 +154,7 @@ Each question below is followed by its one-line answer (from the real run in
    Maritime pricing) and mid-latitude slowest among populated bands (12.4
    months, the largest but lowest-priced core market); the modeled equatorial
    band has **zero active satellites today**, so its 110-month payback is
-   presently hypothetical, not observed. → [Q6 chart](#q6-chart)
+   presently hypothetical, not observed. → [Q6 chart](#user-content-q6-chart)
 
 Rationale for each is inline as a docstring above the corresponding function
 in `analysis/analysis.py`.
