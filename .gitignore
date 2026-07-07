@@ -12,6 +12,7 @@ data/raw/
 
 # generated charts — script produces these, not committed
 analysis/output/
+# (docs/images/ IS committed on purpose -- static snapshots for README display, not pipeline output)
 
 # exercise prompt, not part of the deliverable
 DATA-Technical Exercise-020726-194640.pdf

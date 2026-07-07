@@ -131,6 +131,25 @@ saves three PNG charts from the pandas questions to `analysis/output/`.
 Rationale for each is inline as a docstring above the corresponding function
 in `analysis/analysis.py`.
 
+### Sample charts (real run, 2026-07-06)
+
+Static snapshots committed to `docs/images/` for display here — the pipeline
+itself never commits generated charts (see `analysis/output/` in
+`.gitignore`); re-run `analysis/analysis.py` per above to regenerate fresh
+ones from your own database.
+
+**Q4 — payload mass to orbit over time:**
+
+![Payload mass by orbit over time](docs/images/q4_payload_mass_by_orbit.png)
+
+**Q5 — Starlink altitude distribution & launch cadence:**
+
+![Starlink altitude distribution and deployment cadence](docs/images/q5_starlink_altitude_cadence.png)
+
+**Q6 — Starlink unit economics by orbital band:**
+
+![Starlink revenue per satellite and payback period by orbital band](docs/images/q6_starlink_unit_economics.png)
+
 ## Tests
 
 ```bash
